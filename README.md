@@ -30,7 +30,7 @@ inf uv run python -m resumable_evals.orchestrator \
   --episode ~/runs/ep1 --image eval-cc --workdir /work \
   --mcp "counter=python /opt/eval/counter_mcp_server.py {workdir}/app_data" \
   --faketime-lib /usr/local/lib/libfaketime.so.1 \
-  --api-key-env ANTHROPIC_API_KEY --env ANTHROPIC_API_KEY=placeholder \
+  --oauth-token-env CLAUDE_CODE_OAUTH_TOKEN --env ANTHROPIC_API_KEY=placeholder \
   --timeout 1800 -- \
   claude -p "<task>" --mcp-config {mcp_config} --strict-mcp-config --allowedTools ...
 ```
@@ -39,18 +39,18 @@ The harness, the MCP proxies and the MCP servers run in the container; the model
 
 ## Status
 
-Rollout steps 1–3 (prototype, determinism controls, orchestrator) work, with Docker environments; 30 tests, three of them in Docker:
+Rollout steps 1–3 (prototype, determinism controls, orchestrator) work, with Docker environments; 32 tests, three of them in Docker:
 
 - A container killed mid-episode is rebuilt from its image and the episode finishes with nothing doubled; `date` inside read the pinned step time in both runs.
 - A container running Postgres is killed mid-episode; on the fresh database the re-executed inserts return the same ids and `created_at`, each exactly its step's pinned time.
-- Real Claude Code (host OAuth login, `DirEnvironment`): an episode killed mid-run resumed and finished; a Bash result that differed on rebuild was caught as a divergence. In a container, Claude Code reaches the proxy and Anthropic through it; a live in-container run needs a credential for the proxy (`--api-key-env` / `--oauth-token-env`).
+- Real Claude Code in a container, live (OAuth token from Infisical, added by the proxy; the container only has a placeholder): the container was killed after model step 4; a fresh one replayed and checked steps 0–3 (the MCP call and a Bash file write re-executed in it), went live, and finished the task with nothing doubled. A full replay of that episode in another fresh container matched all 8 steps with no model calls, including a "you've been quiet a while" message Claude Code inserts based on elapsed wall time, which the pinned clock reproduces.
 
 Not done: harnesses other than Claude Code, other model providers, MCP servers over HTTP, multi-host scheduling, snapshots (steps 4–5).
 
 ## Prototype decisions and limits
 
 - **One recording per proxy** (`model.jsonl`, `mcp-<server>.jsonl`), so no two processes write the same file. Each proxy replays its own recording and goes live when it runs out. Recordings sit in the bind-mounted episode directory, so they outlive the container.
-- **Model replies are matched by order**, with a shape check (model, stream flag, message count) and a check of the tool results the harness reports in each request. The latter covers Claude Code's built-in tools (Bash, Write), which never pass through the MCP proxy.
+- **Model replies are matched by order**, with a shape check (model, stream flag, message count) and a check of the tool results the harness reports in each request (every message after the model's last turn: Claude Code sometimes appends its own message after the results). The latter covers Claude Code's built-in tools (Bash, Write), which never pass through the MCP proxy.
 - **Streamed replies are buffered**, so a reply is fsynced before the harness sees any of it. The harness gets the stream all at once.
 - **Model calls and MCP tool calls run one at a time**, in the original run too. Parallel subagents with the same model and message count could be mis-paired on replay; avoid them for now.
 - **Transient model errors (408, 429, 5xx) and auth errors (401, 403) are not recorded**; the harness retries the first, and the second depend on the credential. Other errors are recorded, since the harness reacts to them.

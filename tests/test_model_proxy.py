@@ -197,3 +197,15 @@ def test_proxy_supplies_credentials_harness_never_sees(tmp_path, upstream):
         assert "x-api-key" not in lower and lower.get("authorization") == f"Bearer {TOKEN}"
     assert {k.lower(): v for k, v in upstream.hits[0][1].items()}["anthropic-beta"] == "harness-beta,oauth-2025-04-20"
     assert TOKEN not in rec.read_text()
+
+
+def test_tool_results_followed_by_a_harness_message_are_checked(tmp_path, upstream):
+    rec = tmp_path / "model.jsonl"
+    nudge = {"role": "system", "content": [{"type": "text", "text": "The user hasn't heard from you in a while"}]}
+    proxy, port = start(rec, upstream)
+    call(port, tool_turn(3, "alpha") + [nudge])
+    proxy.httpd.shutdown()
+
+    proxy, port = start(rec, upstream)
+    status, _, body = call(port, tool_turn(3, "beta") + [nudge])
+    assert status == 400 and "tool results differ" in json.loads(body)["error"]["message"]

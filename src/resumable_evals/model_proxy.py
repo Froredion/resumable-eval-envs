@@ -78,17 +78,26 @@ def shape(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_results(body: dict[str, Any]) -> list[dict[str, Any]]:
-    """Tool results the harness is reporting in this request (its last message)."""
+    """Tool results the harness is reporting in this request.
+
+    They are in the messages after the model's last turn; usually one user
+    message, but a harness can add its own after it (Claude Code appends a
+    system message when a step has taken a while), so all of them count.
+    """
     messages = body.get("messages") or []
-    last = messages[-1] if messages else {}
-    content = last.get("content") if isinstance(last, dict) else None
-    if not isinstance(content, list):
-        return []
-    return [
-        {"content": b.get("content"), "is_error": bool(b.get("is_error"))}
-        for b in content
-        if isinstance(b, dict) and b.get("type") == "tool_result"
-    ]
+    i = len(messages)
+    while i > 0 and not (isinstance(messages[i - 1], dict) and messages[i - 1].get("role") == "assistant"):
+        i -= 1
+    out = []
+    for message in messages[i:]:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            out += [
+                {"content": b.get("content"), "is_error": bool(b.get("is_error"))}
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "tool_result"
+            ]
+    return out
 
 
 def unrecorded(status: int) -> bool:
