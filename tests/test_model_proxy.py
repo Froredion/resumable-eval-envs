@@ -34,7 +34,9 @@ class FakeUpstream:
                     return self._send(200, "text/event-stream", data)
                 self._send(200, "application/json", json.dumps({"content": [{"text": f"reply{n}"}]}).encode())
 
-            do_GET = lambda self: self._send(200, "application/json", b'{"data":[]}') or up.hits.append((self.path, {}))
+            def do_GET(self):
+                up.hits.append((self.path, dict(self.headers)))
+                self._send(200, "application/json", b'{"data":[]}')
 
             def _send(self, status, ctype, data):
                 self.send_response(status)
@@ -58,17 +60,18 @@ def upstream():
     up.httpd.shutdown()
 
 
-def start(rec, upstream, clock=None):
-    proxy = ModelProxy(Recording(rec), upstream.url, clock)
+def start(rec, upstream, clock=None, headers=None):
+    proxy = ModelProxy(Recording(rec), upstream.url, clock, headers)
     httpd = proxy.serve()
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return proxy, httpd.server_address[1]
 
 
-def call(port, messages, model="claude-opus-5-5", stream=False, method="POST", path="/v1/messages?beta=true"):
+def call(port, messages, model="claude-opus-5-5", stream=False, method="POST", path="/v1/messages?beta=true", auth=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     body = json.dumps({"model": model, "stream": stream, "messages": messages}) if method == "POST" else None
-    conn.request(method, path, body=body, headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+    headers = auth or {"Authorization": f"Bearer {TOKEN}"}
+    conn.request(method, path, body=body, headers=headers | {"Content-Type": "application/json"})
     r = conn.getresponse()
     out = r.status, r.getheader("Content-Type"), r.read()
     conn.close()
@@ -180,3 +183,16 @@ def test_clock_pinned_to_recorded_time(tmp_path, upstream):
     call(port, msgs(1))
     assert clock.path.read_text() == f"@{int(t)}\n"  # rebuild pins the recorded time
     proxy.httpd.shutdown()
+
+
+def test_proxy_supplies_credentials_harness_never_sees(tmp_path, upstream):
+    rec = tmp_path / "model.jsonl"
+    proxy, port = start(rec, upstream, headers={"Authorization": f"Bearer {TOKEN}", "anthropic-beta": "oauth-2025-04-20"})
+    call(port, msgs(1), auth={"x-api-key": "placeholder", "anthropic-beta": "harness-beta"})
+    call(port, None, method="GET", path="/v1/models", auth={"x-api-key": "placeholder"})
+    proxy.httpd.shutdown()
+    for _, headers in upstream.hits:
+        lower = {k.lower(): v for k, v in headers.items()}
+        assert "x-api-key" not in lower and lower.get("authorization") == f"Bearer {TOKEN}"
+    assert {k.lower(): v for k, v in upstream.hits[0][1].items()}["anthropic-beta"] == "harness-beta,oauth-2025-04-20"
+    assert TOKEN not in rec.read_text()

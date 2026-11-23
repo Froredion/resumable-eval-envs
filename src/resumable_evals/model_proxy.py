@@ -32,8 +32,12 @@ whole rather than relayed incrementally. Transient failures (408, 429, 5xx)
 are not recorded: the harness retries them with the same request, so the
 rebuild needs only the reply to the retry.
 
-Auth headers (``x-api-key``, OAuth ``Authorization: Bearer``) are forwarded
-and never recorded; a rebuild does not need them until it goes live.
+Auth headers (``x-api-key``, OAuth ``Authorization: Bearer``) are never
+recorded; a rebuild does not need them until it goes live. By default the
+harness's own are forwarded. With ``upstream_headers`` the proxy drops the
+harness's and adds its own instead, so the credential never enters the eval
+environment (where the agent could read it); the harness then only needs a
+placeholder key.
 """
 
 from __future__ import annotations
@@ -96,9 +100,16 @@ def _error(status: int, message: str, kind: str = "api_error") -> Response:
 
 
 class ModelProxy:
-    def __init__(self, recording: Recording, upstream: str = "https://api.anthropic.com", clock: Clock | None = None):
+    def __init__(
+        self,
+        recording: Recording,
+        upstream: str = "https://api.anthropic.com",
+        clock: Clock | None = None,
+        upstream_headers: dict[str, str] | None = None,
+    ):
         self.recording = recording
         self.clock = clock
+        self.upstream_headers = upstream_headers or {}
         self.on_record: Callable[[int], None] | None = None  # called with the step count after each live reply is recorded
         self.cursor = RebuildCursor(recording)
         u = urlsplit(upstream)
@@ -121,7 +132,16 @@ class ModelProxy:
 
     def forward(self, method: str, path: str, headers: Any, body: bytes | None) -> Response:
         skip = HOP_BY_HOP | {"host", "content-length", "accept-encoding"}
+        if self.upstream_headers:
+            skip |= {"x-api-key", "authorization"}
         out = {k: v for k, v in headers.items() if k.lower() not in skip}
+        for k, v in self.upstream_headers.items():
+            mine = next((h for h in out if h.lower() == k.lower()), None)
+            if mine and k.lower() == "anthropic-beta":
+                out[mine] = f"{out[mine]},{v}"  # keep the harness's betas
+            else:
+                out.pop(mine, None)
+                out[k] = v
         out["Accept-Encoding"] = "identity"  # store and replay plain text
         conn_cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
         conn = conn_cls(self._netloc, timeout=600)

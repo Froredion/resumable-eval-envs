@@ -11,15 +11,18 @@ for the next clock read, in processes already running too.
 
 Processes see the pinned clock when started with :meth:`Clock.env` and a
 libfaketime library to preload (``libfaketime.so.1`` in a Linux image).
-Checked with libfaketime 0.9.10 on Debian bookworm, with the file written by
-the host into a bind-mounted directory.
+Checked with libfaketime 0.9.10 on Debian.
+
+The file must live where the environment's processes read it reliably. In a
+container that means the container's own filesystem, written with
+``docker exec`` (see ``environments``): through Docker Desktop's bind mounts
+a file updated on the host reads as missing for a while after a rename (and
+libfaketime silently falls back to the real clock), or keeps its old
+content after an in-place write.
 
 Not covered: file modification times. The kernel stamps them, so ``ls -l``
 or ``stat`` output differs between runs; the per-step result check reports
 that as a divergence until a normalization rule (with a test) covers it.
-On Docker Desktop for macOS, keep the clock file under a directory Docker
-shares (``$HOME``, not ``/var/folders``), or the container sees an empty
-directory and the real clock.
 """
 
 from __future__ import annotations
@@ -27,21 +30,30 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 
 class Clock:
-    def __init__(self, path: Path | str):
-        self.path = Path(path)
+    def __init__(self, path: Path | str, write: Callable[[str], None] | None = None):
+        self.path = Path(path)  # where the environment's processes read it
+        self._write = write or self._write_local
 
     def pin(self, t: float) -> None:
         """Make the environment's clock read ``t`` (epoch seconds) from now on."""
+        self._write(f"@{int(t)}\n")
+
+    def _write_local(self, text: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(f"@{int(t)}\n")
+        tmp.write_text(text)
         os.replace(tmp, self.path)  # readers never see a half-written file
 
-    def env(self, lib: str | None = None) -> dict[str, str]:
-        """Environment variables that put a process on this clock."""
+    def env(self, lib: str | None = None, platform: str = sys.platform) -> dict[str, str]:
+        """Environment variables that put a process on this clock.
+
+        ``platform`` is the OS the process runs on, which decides how ``lib``
+        is preloaded.
+        """
         env = {
             "FAKETIME_TIMESTAMP_FILE": str(self.path),
             "FAKETIME_FMT": "%s",
@@ -49,7 +61,7 @@ class Clock:
             "FAKETIME_DONT_FAKE_MONOTONIC": "1",
         }
         if lib:
-            if sys.platform == "darwin":
+            if platform == "darwin":
                 env |= {"DYLD_INSERT_LIBRARIES": lib, "DYLD_FORCE_FLAT_NAMESPACE": "1"}
             else:
                 env["LD_PRELOAD"] = lib

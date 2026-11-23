@@ -3,8 +3,9 @@
 Talks to the model at $ANTHROPIC_BASE_URL and runs the tools the model asks
 for: ``incr`` through the MCP server named ``fake`` in the MCP config given
 as argv[1], and two tools of its own, like Claude Code's Bash and Write:
-``clock`` reads the pinned clock and ``note`` appends to notes.txt in the
-working directory. Crashes once, partway through a step, if $CRASH_MARKER
+``clock`` reads the clock (``date`` when libfaketime is preloaded, else the
+pinned clock file) and ``note`` appends to notes.txt in the working
+directory. Crashes once, partway through a step, if $CRASH_MARKER
 names an existing file and the step is $CRASH_AT_STEP.
 """
 
@@ -19,7 +20,8 @@ from urllib.parse import urlsplit
 
 class Mcp:
     def __init__(self, spec):
-        self.proc = subprocess.Popen([spec["command"], *spec["args"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.proc = subprocess.Popen([spec["command"], *spec["args"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     env=os.environ | spec.get("env", {}))
         self.n = 0
         self.request("initialize", {})
 
@@ -71,7 +73,10 @@ while True:
         if block["name"] == "incr":
             text, error = mcp.call("incr")
         elif block["name"] == "clock":
-            text = Path(os.environ["FAKETIME_TIMESTAMP_FILE"]).read_text()
+            if "LD_PRELOAD" in os.environ:
+                text = subprocess.run(["date", "-u", "+%s"], capture_output=True, text=True).stdout
+            else:
+                text = Path(os.environ["FAKETIME_TIMESTAMP_FILE"]).read_text()
         elif block["name"] == "note":
             with open("notes.txt", "a") as f:
                 f.write(f"step {step}\n")

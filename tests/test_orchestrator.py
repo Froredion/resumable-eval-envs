@@ -98,7 +98,7 @@ def test_crash_mid_step_rebuilds_and_resumes(tmp_path, base, upstream):
 
 def test_fault_after_reply_recorded_but_not_delivered(tmp_path, base, upstream):
     meta = episode(tmp_path, base, upstream, fault_after_steps=2).run()
-    assert meta["attempts"][0]["reason"] == "fault injected after step 2"
+    assert meta["attempts"][0]["reason"] == "fault injected (harness) after step 2"
     assert meta["status"] == "completed" and meta["resumed_from_steps"] == [2]
     assert final_state(tmp_path) == (["step 0", "step 1", "step 2"], "3", "counted")
     assert upstream.hits == 4
@@ -109,12 +109,13 @@ class DirtyOnRebuild(DirEnvironment):
 
     starts = 0
 
-    def start(self):
-        work = super().start()
+    def start(self, episode_dir):
+        rt = super().start(episode_dir)
+        work = Path(rt.workdir)
         self.starts += 1
         if self.starts == 2:
             (work / "app_data" / "counter").write_text("5")
-        return work
+        return rt
 
 
 def test_divergence_reruns_from_scratch(tmp_path, base, upstream):
