@@ -47,7 +47,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from .clock import Clock
@@ -99,6 +99,7 @@ class ModelProxy:
     def __init__(self, recording: Recording, upstream: str = "https://api.anthropic.com", clock: Clock | None = None):
         self.recording = recording
         self.clock = clock
+        self.on_record: Callable[[int], None] | None = None  # called with the step count after each live reply is recorded
         self.cursor = RebuildCursor(recording)
         u = urlsplit(upstream)
         self._https = u.scheme == "https"
@@ -108,6 +109,11 @@ class ModelProxy:
         self._steps = len(recording.of_kind("model"))
         self.diverged: Diverged | None = None
         self.httpd: ThreadingHTTPServer | None = None
+
+    @property
+    def steps(self) -> int:
+        """Model steps in the recording so far, rebuilt and live."""
+        return self._steps
 
     @property
     def diverged_path(self) -> Path:
@@ -163,6 +169,8 @@ class ModelProxy:
                 self._steps += 1
                 if self.clock:
                     self.clock.pin(t)
+                if self.on_record:
+                    self.on_record(self._steps)
             return status, out, data
 
     def _diverge(self, event: Any, detail: str) -> Response:

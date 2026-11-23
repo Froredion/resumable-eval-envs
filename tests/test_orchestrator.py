@@ -1,0 +1,144 @@
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from resumable_evals.orchestrator import DirEnvironment, Episode
+from resumable_evals.recording import Recording
+
+HERE = Path(__file__).parent
+HARNESS = [sys.executable, str(HERE / "fake_harness.py"), "{mcp_config}"]
+MCP = {"fake": [sys.executable, str(HERE / "fake_mcp_server.py"), "{workdir}/app_data"]}
+
+
+class Upstream:
+    """Stateless scripted model: three steps of [incr, clock, note], then end_turn."""
+
+    def __init__(self):
+        self.hits = 0
+        up = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                up.hits += 1
+                n = len(body["messages"])
+                if n < 7:
+                    content = [{"type": "tool_use", "id": f"toolu_{n}_{i}", "name": t, "input": {}}
+                               for i, t in enumerate(["incr", "clock", "note"])]
+                    reply = {"content": content, "stop_reason": "tool_use"}
+                else:
+                    reply = {"content": [{"type": "text", "text": "counted"}], "stop_reason": "end_turn"}
+                data = json.dumps(reply).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+
+@pytest.fixture
+def upstream():
+    up = Upstream()
+    yield up
+    up.httpd.shutdown()
+
+
+@pytest.fixture
+def base(tmp_path):
+    b = tmp_path / "base"
+    (b / "app_data").mkdir(parents=True)
+    return b
+
+
+def episode(tmp_path, base, upstream, **kw):
+    return Episode(dir=tmp_path / "episode", harness=HARNESS, environment=DirEnvironment(base, tmp_path / "work"),
+                   mcp_servers=MCP, upstream=upstream.url, timeout=30, **kw)
+
+
+def crash_once(tmp_path, at_step):
+    marker = tmp_path / "crash-marker"
+    marker.touch()
+    return {"CRASH_MARKER": str(marker), "CRASH_AT_STEP": str(at_step)}
+
+
+def final_state(tmp_path):
+    work = tmp_path / "work"
+    return (work / "notes.txt").read_text().splitlines(), (work / "app_data" / "counter").read_text(), (work / "done.txt").read_text()
+
+
+def test_clean_run(tmp_path, base, upstream):
+    meta = episode(tmp_path, base, upstream).run()
+    assert meta["status"] == "completed" and not meta["resumed"] and len(meta["attempts"]) == 1
+    assert final_state(tmp_path) == (["step 0", "step 1", "step 2"], "3", "counted")
+    assert upstream.hits == 4
+
+
+def test_crash_mid_step_rebuilds_and_resumes(tmp_path, base, upstream):
+    meta = episode(tmp_path, base, upstream, env=crash_once(tmp_path, at_step=1)).run()
+    assert [a["outcome"] for a in meta["attempts"]] == ["failed", "completed"]
+    assert meta["status"] == "completed" and meta["resumed"] and meta["resumed_from_steps"] == [2]
+    # Fresh environment: the crashed attempt's half-done step is not doubled.
+    assert final_state(tmp_path) == (["step 0", "step 1", "step 2"], "3", "counted")
+    assert upstream.hits == 4  # replayed steps were never re-requested
+    assert len(Recording(tmp_path / "episode" / "mcp-fake.jsonl").events) == 3
+
+
+def test_fault_after_reply_recorded_but_not_delivered(tmp_path, base, upstream):
+    meta = episode(tmp_path, base, upstream, fault_after_steps=2).run()
+    assert meta["attempts"][0]["reason"] == "fault injected after step 2"
+    assert meta["status"] == "completed" and meta["resumed_from_steps"] == [2]
+    assert final_state(tmp_path) == (["step 0", "step 1", "step 2"], "3", "counted")
+    assert upstream.hits == 4
+
+
+class DirtyOnRebuild(DirEnvironment):
+    """An environment that is not fresh on its second start (state leaked into app_data/)."""
+
+    starts = 0
+
+    def start(self):
+        work = super().start()
+        self.starts += 1
+        if self.starts == 2:
+            (work / "app_data" / "counter").write_text("5")
+        return work
+
+
+def test_divergence_reruns_from_scratch(tmp_path, base, upstream):
+    ep = episode(tmp_path, base, upstream, env=crash_once(tmp_path, at_step=1))
+    ep.environment = DirtyOnRebuild(base, tmp_path / "work")
+    meta = ep.run()
+    assert [a["outcome"] for a in meta["attempts"]] == ["failed", "diverged", "completed"]
+    div = meta["attempts"][1]["divergence"]
+    assert any(d["recording"] == "mcp-fake.jsonl" for d in div)
+    assert meta["status"] == "completed" and meta["reran_after_divergence"] and not meta["resumed"]
+    assert (tmp_path / "episode" / "diverged-1" / "mcp-fake.jsonl.diverged.json").exists()
+    assert final_state(tmp_path) == (["step 0", "step 1", "step 2"], "3", "counted")
+
+
+def test_divergence_can_end_the_episode(tmp_path, base, upstream):
+    ep = episode(tmp_path, base, upstream, env=crash_once(tmp_path, at_step=1), rerun_on_divergence=False)
+    ep.environment = DirtyOnRebuild(base, tmp_path / "work")
+    meta = ep.run()
+    assert meta["status"] == "diverged" and len(meta["attempts"]) == 2
+
+
+def test_timeout_counts_as_failure(tmp_path, base, upstream):
+    ep = episode(tmp_path, base, upstream, max_attempts=2)
+    ep.harness, ep.timeout = [sys.executable, "-c", "import time; time.sleep(30)"], 0.5
+    meta = ep.run()
+    assert meta["status"] == "failed"
+    assert [a["reason"] for a in meta["attempts"]] == ["timeout after 0.5s"] * 2
