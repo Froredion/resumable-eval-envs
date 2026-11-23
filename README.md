@@ -31,6 +31,8 @@ inf uv run python -m resumable_evals.orchestrator \
   --mcp "counter=python /opt/eval/counter_mcp_server.py {workdir}/app_data" \
   --faketime-lib /usr/local/lib/libfaketime.so.1 \
   --oauth-token-env CLAUDE_CODE_OAUTH_TOKEN --env ANTHROPIC_API_KEY=placeholder \
+  --volume pgdata=/var/lib/postgresql/data \
+  --state-probe 'db=pg_dump -U postgres --data-only app | sha256sum' \
   --timeout 1800 -- \
   claude -p "<task>" --mcp-config {mcp_config} --strict-mcp-config --allowedTools ...
 ```
@@ -39,13 +41,23 @@ The harness, the MCP proxies and the MCP servers run in the container; the model
 
 ## Status
 
-Rollout steps 1–3 (prototype, determinism controls, orchestrator) work, with Docker environments; 32 tests, three of them in Docker:
+Rollout steps 1–3 (prototype, determinism controls, orchestrator) work, with Docker environments; 47 tests, five of them in Docker:
 
 - A container killed mid-episode is rebuilt from its image and the episode finishes with nothing doubled; `date` inside read the pinned step time in both runs.
 - A container running Postgres is killed mid-episode; on the fresh database the re-executed inserts return the same ids and `created_at`, each exactly its step's pinned time.
 - Real Claude Code in a container, live (OAuth token from Infisical, added by the proxy; the container only has a placeholder): the container was killed after model step 4; a fresh one replayed and checked steps 0–3 (the MCP call and a Bash file write re-executed in it), went live, and finished the task with nothing doubled. A full replay of that episode in another fresh container matched all 8 steps with no model calls, including a "you've been quiet a while" message Claude Code inserts based on elapsed wall time, which the pinned clock reproduces.
 
 Not done: harnesses other than Claude Code, other model providers, MCP servers over HTTP, multi-host scheduling, snapshots (steps 4–5).
+
+## MCP server state and databases
+
+State is rebuilt, not restored: a fresh container starts with an empty `app_data/` and an empty database, and re-executing the recorded tool calls rebuilds both (and any in-memory MCP server state, since the servers restart and get the same calls in the same order). A write the original run committed but never recorded does not exist in the fresh environment. Three things keep that honest:
+
+- **Every tool result is compared** with the recording, including ids and `created_at` (the database runs on the pinned clock).
+- **State probes** (`--state-probe NAME=COMMAND`, run inside the environment before every model step) cover side effects no tool result shows: a probe's exit status and output hash are recorded and must replay. Without one, a tool that writes a different value but returns the same text passes silently; there is a test showing exactly that, and one showing the probe catching it. Probes must be deterministic: order query results, and hash logical dumps rather than files Postgres may rewrite.
+- **Nothing carries state across attempts:** containers are removed with their anonymous volumes (the Postgres image keeps its data in one), `--volume NAME=PATH` volumes are recreated empty per attempt, and a named volume or writable host directory in `--docker-arg` is refused.
+
+Not covered yet: databases or MCP servers in other containers (sidecars, compose services) are not reset between attempts; only single-container environments are supported.
 
 ## Prototype decisions and limits
 

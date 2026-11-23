@@ -21,6 +21,13 @@ runs itself, such as Claude Code's Bash and Write, which never pass through
 the MCP proxy. On any mismatch the harness gets a non-retryable 400, details
 go to ``<recording>.diverged.json`` and the proxy stops with status 3.
 
+With a ``state_probe``, the environment's state is also checked at every
+step: the probe runs before each model request is answered (so it sees the
+effects of everything the previous step did, tool calls and the harness's
+own commands alike), its result is recorded with the step, and on rebuild
+it must match. That catches side effects no tool result shows, such as a
+database row written with a different value.
+
 With a :class:`~resumable_evals.clock.Clock`, each reply pins the
 environment's clock: to now when live (recorded with the event), to the
 recorded time on rebuild.
@@ -100,6 +107,13 @@ def tool_results(body: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def state_differences(recorded: dict[str, Any], state: dict[str, Any]) -> list[str]:
+    """Names of state probes whose result differs from the recording."""
+    names = sorted(set(recorded) | set(state))
+    return [n for n in names if (recorded.get(n) or {}).get("sha256") != (state.get(n) or {}).get("sha256")
+            or (recorded.get(n) or {}).get("exit") != (state.get(n) or {}).get("exit")]
+
+
 def unrecorded(status: int) -> bool:
     """Failures that say nothing about the episode: transient ones the harness
     retries, and auth failures that depend on the credential. Replaying either
@@ -123,6 +137,7 @@ class ModelProxy:
         self.recording = recording
         self.clock = clock
         self.upstream_headers = upstream_headers or {}
+        self.state_probe: Callable[[], dict[str, Any]] | None = None  # see the module docstring
         self.on_record: Callable[[int], None] | None = None  # called with the step count after each live reply is recorded
         self.cursor = RebuildCursor(recording)
         u = urlsplit(upstream)
@@ -185,10 +200,17 @@ class ModelProxy:
                 mismatch = compare(tool_results(event.request["body"]), tool_results(body))
                 if mismatch:
                     return self._diverge(event, f"tool results differ: {mismatch}")
+                if self.state_probe and "state" in event.meta:
+                    state = self.state_probe()
+                    differing = state_differences(event.meta["state"], state)
+                    if differing:
+                        return self._diverge(event, f"environment state differs: {', '.join(differing)}",
+                                             {"recorded_state": event.meta["state"], "state": state})
                 reply = self.cursor.next_model_reply()
                 if self.clock and "t" in event.meta:
                     self.clock.pin(event.meta["t"])
                 return reply["status"], [("Content-Type", reply["content_type"])], reply["body"].encode()
+            state = self.state_probe() if self.state_probe else None
             status, out, data = self.forward("POST", path, headers, raw)
             self.auth_failed = status if status in (401, 403) else None
             if not unrecorded(status):
@@ -200,6 +222,7 @@ class ModelProxy:
                     {"path": path, "shape": shape(body), "body": body},
                     {"status": status, "content_type": content_type, "body": data.decode()},
                     t=t,
+                    **({"state": state} if state is not None else {}),
                 )
                 self._steps += 1
                 if self.clock:
@@ -208,11 +231,11 @@ class ModelProxy:
                     self.on_record(self._steps)
             return status, out, data
 
-    def _diverge(self, event: Any, detail: str) -> Response:
+    def _diverge(self, event: Any, detail: str, extra: dict[str, Any] | None = None) -> Response:
         d = Diverged(event, detail)
         self.diverged = d
         with self.diverged_path.open("w") as f:
-            json.dump({"seq": event.seq, "step": event.step, "detail": detail}, f, indent=2)
+            json.dump({"seq": event.seq, "step": event.step, "detail": detail} | (extra or {}), f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         print(f"resumable-evals: rebuild {d}", file=sys.stderr)

@@ -33,6 +33,7 @@ resumed episodes can be filtered or compared.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -56,6 +57,7 @@ class Episode:
     harness: list[str]
     environment: Environment
     mcp_servers: dict[str, list[str]] = field(default_factory=dict)  # name -> argv inside the environment
+    state_probes: dict[str, list[str]] = field(default_factory=dict)  # name -> argv inside; output checked every step
     upstream: str = "https://api.anthropic.com"
     upstream_headers: dict[str, str] = field(default_factory=dict)  # auth the proxy adds; never enters the environment
     env: dict[str, str] = field(default_factory=dict)
@@ -112,6 +114,8 @@ class Episode:
         }
         rt = self.environment.start(self.dir, boot_env)
         proxy = ModelProxy(recording, self.upstream, clock, self.upstream_headers)
+        if self.state_probes:
+            proxy.state_probe = lambda: self._probe(rt, boot_env)
         httpd = proxy.serve(self.environment.proxy_bind)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
@@ -162,6 +166,23 @@ class Episode:
         if record["outcome"] != "completed":
             self.environment.stop()
         return record
+
+    def _probe(self, rt: Runtime, env: dict[str, str]) -> dict[str, Any]:
+        """Run every state probe inside the environment. Small outputs are kept
+        for divergence reports; the comparison uses exit status and hash."""
+        out: dict[str, Any] = {}
+        for name, argv in self.state_probes.items():
+            cmd, host_env, cwd = rt.command([a.format(workdir=rt.workdir) for a in argv], env)
+            try:
+                p = subprocess.run(cmd, env=host_env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+                result = {"exit": p.returncode, "sha256": hashlib.sha256(p.stdout).hexdigest()}
+                text = p.stdout.decode(errors="replace")
+                if len(text) <= 4096:
+                    result["output"] = text
+            except subprocess.TimeoutExpired:
+                result = {"exit": None, "sha256": None, "output": "probe timed out"}
+            out[name] = result
+        return out
 
     def _write_mcp_config(self, rt: Runtime) -> None:
         servers = {
@@ -235,10 +256,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--image", help="Docker image: a fresh container per attempt")
     parser.add_argument("--name", help="container name (default: from the episode directory)")
     parser.add_argument("--docker-arg", action="append", default=[], help="extra `docker run` argument (repeat)")
+    parser.add_argument("--volume", action="append", default=[], metavar="NAME=PATH",
+                        help="volume mounted at PATH, recreated empty every attempt (repeat)")
     parser.add_argument("--proxy-bind", default="127.0.0.1", help="model proxy address the container can reach")
     parser.add_argument("--base", type=Path, help="without --image: base directory, copied fresh per attempt")
     parser.add_argument("--workdir", help="harness working directory (inside the container with --image)")
     parser.add_argument("--mcp", action="append", default=[], metavar="NAME=COMMAND", help="MCP server to proxy; {workdir} expands")
+    parser.add_argument("--state-probe", action="append", default=[], metavar="NAME=COMMAND",
+                        help="command run inside the environment every step; its output must replay (repeat)")
     parser.add_argument("--upstream", default="https://api.anthropic.com")
     parser.add_argument("--api-key-env", help="host env var holding an Anthropic API key the proxy adds upstream")
     parser.add_argument("--oauth-token-env", help="host env var holding a Claude OAuth token the proxy adds upstream")
@@ -260,9 +285,15 @@ def main(argv: list[str] | None = None) -> int:
     for spec in args.mcp:
         name, _, command = spec.partition("=")
         servers[name] = shlex.split(command)
+    probes = {}
+    for spec in args.state_probe:
+        name, _, command = spec.partition("=")
+        probes[name] = ["sh", "-c", command]
     if args.image:
         name = args.name or f"resumable-{args.episode.resolve().name}"
-        environment: Environment = DockerEnvironment(args.image, name, args.workdir or "/work", args.docker_arg, args.proxy_bind)
+        volumes = dict(v.partition("=")[::2] for v in args.volume)
+        environment: Environment = DockerEnvironment(args.image, name, args.workdir or "/work", args.docker_arg,
+                                                     args.proxy_bind, volumes)
     elif args.base and args.workdir:
         environment = DirEnvironment(args.base, Path(args.workdir))
     else:
@@ -274,7 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.oauth_token_env:
         headers = oauth_headers(os.environ.pop(args.oauth_token_env))
     episode = Episode(
-        dir=args.episode, harness=cmd, environment=environment, mcp_servers=servers, upstream=args.upstream,
+        dir=args.episode, harness=cmd, environment=environment, mcp_servers=servers, state_probes=probes,
+        upstream=args.upstream,
         env=dict(kv.partition("=")[::2] for kv in args.env),
         upstream_headers=headers, faketime_lib=args.faketime_lib, clock_mode=args.clock, seed=args.seed, max_attempts=args.max_attempts,
         timeout=args.timeout, rerun_on_divergence=not args.no_rerun_on_divergence,

@@ -121,6 +121,12 @@ class DockerEnvironment:
     then wait); the harness is run with ``docker exec``. Python 3.9+ must be
     on the image's PATH as ``python``, for the MCP proxy.
 
+    Nothing may carry state from one attempt to the next, or the rebuild
+    would start from a dirty environment: containers are removed with their
+    anonymous volumes (the Postgres image keeps its data in one), volumes
+    listed in ``volumes`` are recreated empty per attempt, and ``run_args``
+    may not mount a named volume or a writable host directory.
+
     On Docker Desktop for macOS the episode directory must be somewhere
     Docker shares (under ``$HOME``), or the container gets an empty mount.
     On Linux, ``proxy_bind`` must be an address the container can reach,
@@ -131,7 +137,8 @@ class DockerEnvironment:
     image: str
     name: str
     workdir: str = "/work"
-    run_args: list[str] = field(default_factory=list)  # e.g. --network, extra volumes, --memory
+    run_args: list[str] = field(default_factory=list)  # e.g. --network, --memory, read-only mounts
+    volumes: dict[str, str] = field(default_factory=dict)  # name -> path inside; recreated empty every attempt
     proxy_bind: str = "127.0.0.1"
     episode_mount: str = "/resumable"
     python: str = "python"
@@ -139,6 +146,7 @@ class DockerEnvironment:
     clock: Clock = field(init=False)
 
     def __post_init__(self) -> None:
+        check_mounts(self.run_args)
         self.clock = Clock(CONTAINER_CLOCK, self._write_clock)
         self._staged_clock: str | None = None
         self._running = False
@@ -150,6 +158,7 @@ class DockerEnvironment:
                 "--add-host", "host.docker.internal:host-gateway",
                 "-v", f"{episode_dir.resolve()}:{self.episode_mount}",
                 "-v", f"{PACKAGE_ROOT}:/opt/resumable-evals:ro",
+                *(x for key, path in self.volumes.items() for x in ("-v", f"{self._volume(key)}:{path}")),
                 *env_flags, *self.run_args, self.image)
         if self._staged_clock is not None:
             # In place before the image's command starts its services.
@@ -195,8 +204,13 @@ class DockerEnvironment:
             if self.alive():
                 raise  # a running container whose clock cannot be pinned would drift unnoticed until a divergence
 
+    def _volume(self, key: str) -> str:
+        return f"{self.name}-{key}"
+
     def stop(self) -> None:
-        _docker("rm", "-f", self.name, check=False)
+        _docker("rm", "-f", "-v", self.name, check=False)  # -v: its anonymous volumes too
+        for key in self.volumes:
+            _docker("volume", "rm", "-f", self._volume(key), check=False)
         self._running = False
 
     def kill(self) -> None:
@@ -208,6 +222,44 @@ class DockerEnvironment:
     def exec(self, *argv: str) -> str:
         """Run a command in the container (for grading or inspecting the final state)."""
         return _docker("exec", "-w", self.workdir, self.name, *argv)
+
+
+def check_mounts(run_args: list[str]) -> None:
+    """Refuse ``docker run`` mounts that would keep state across attempts.
+
+    A named volume or a writable host directory outlives the container, so a
+    rebuild would start with the previous attempt's database or files. Use
+    ``volumes`` for named volumes (recreated per attempt) and mount host
+    directories read-only.
+    """
+    specs: list[tuple[str, str]] = []
+    it = iter(run_args)
+    for a in it:
+        if a in ("-v", "--volume", "--mount"):
+            specs.append((a, next(it, "")))
+        elif a.startswith(("--volume=", "--mount=")):
+            flag, _, value = a.partition("=")
+            specs.append((flag, value))
+    for flag, spec in specs:
+        if flag == "--mount":
+            opts = dict(kv.partition("=")[::2] for kv in spec.split(","))
+            kind = opts.get("type", "volume")
+            source = opts.get("source") or opts.get("src")
+            readonly = "readonly" in opts or "ro" in opts
+            if kind == "volume" and source:
+                raise ValueError(f"--mount {spec}: named volume outlives the container; use DockerEnvironment.volumes")
+            if kind == "bind" and not readonly:
+                raise ValueError(f"--mount {spec}: writable host directory outlives the container; add readonly")
+        else:
+            parts = spec.split(":")
+            if len(parts) == 1:
+                continue  # anonymous volume: removed with the container
+            source, opts = parts[0], parts[2].split(",") if len(parts) > 2 else []
+            if source.startswith(("/", ".", "~")):
+                if "ro" not in opts:
+                    raise ValueError(f"-v {spec}: writable host directory outlives the container; mount it :ro")
+            else:
+                raise ValueError(f"-v {spec}: named volume outlives the container; use DockerEnvironment.volumes")
 
 
 def _docker(*args: str, check: bool = True, input: str | None = None) -> str:

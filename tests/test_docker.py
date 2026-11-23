@@ -93,10 +93,24 @@ def pg_image():
     return PG_IMAGE
 
 
+PSQL = ["psql", "-h", "127.0.0.1", "-U", "postgres", "-qAt", "-c"]
+
+
+def dangling_volumes():
+    return set(subprocess.run(["docker", "volume", "ls", "-qf", "dangling=true"], capture_output=True, text=True).stdout.split())
+
+
 def test_postgres_rebuilt_by_reexecution(pg_image, shared_dir, upstream):
-    """The design's core case: a database in the environment, lost with the container, rebuilt by re-execution."""
-    env = DockerEnvironment(pg_image, f"resumable-test-pg-{shared_dir.name}")
+    """The design's core case: a database in the environment, lost with the container, rebuilt by re-execution.
+
+    The data directory is a named volume, recreated empty for the rebuild; the
+    events table is checked against the recording at every step.
+    """
+    before = dangling_volumes()
+    env = DockerEnvironment(pg_image, f"resumable-test-pg-{shared_dir.name}",
+                            volumes={"pgdata": "/var/lib/postgresql/data"})
     ep = Episode(
+        state_probes={"events": [*PSQL, "SELECT id, created_at FROM events ORDER BY id"]},
         dir=shared_dir / "episode",
         harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
         environment=env,
@@ -121,5 +135,51 @@ def test_postgres_rebuilt_by_reexecution(pg_image, shared_dir, upstream):
         final = env.exec("psql", "-h", "127.0.0.1", "-U", "postgres", "-At", "-c",
                          "SELECT id, extract(epoch FROM created_at)::bigint FROM events ORDER BY id").split()
         assert final == [f"{i + 1}|{t}" for i, t in enumerate(step_times[:3])]
+        recorded_states = [e.meta["state"]["events"] for e in Recording(shared_dir / "episode" / "model.jsonl").events]
+        assert recorded_states[-1]["output"].count("\n") == 3  # the probe saw all three rows by the last step
     finally:
         env.stop()
+    leftover = subprocess.run(["docker", "volume", "ls", "-q", "--filter", f"name={env.name}"], capture_output=True, text=True)
+    assert leftover.stdout.strip() == ""
+    assert dangling_volumes() <= before  # anonymous volumes went with their containers
+
+
+def hidden_effect_episode(pg_image, shared_dir, upstream, probes):
+    env = DockerEnvironment(pg_image, f"resumable-test-hid-{shared_dir.name}")
+    ep = Episode(
+        dir=shared_dir / "episode",
+        harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
+        environment=env,
+        mcp_servers={"fake": ["env", "PG_HIDDEN_RANDOM=1", "python", "/opt/eval/pg_mcp_server.py"]},
+        state_probes=probes,
+        upstream=upstream.url,
+        faketime_lib="/usr/local/lib/libfaketime.so.1",
+        timeout=180,
+        fault_after_steps=2,
+        fault="environment",
+        rerun_on_divergence=False,
+    )
+    return env, ep
+
+
+def test_hidden_database_difference_is_caught_by_a_state_probe(pg_image, shared_dir, upstream):
+    env, ep = hidden_effect_episode(pg_image, shared_dir, upstream,
+                                    {"side": [*PSQL, "SELECT id, v FROM side ORDER BY id"]})
+    try:
+        meta = ep.run()
+    finally:
+        env.stop()
+    assert meta["status"] == "diverged"
+    report = meta["attempts"][1]["divergence"][0]
+    assert report["recording"] == "model.jsonl" and "environment state differs: side" in report["detail"]
+    assert report["recorded_state"]["side"]["output"] != report["state"]["side"]["output"]
+
+
+def test_without_a_probe_a_hidden_difference_goes_unseen(pg_image, shared_dir, upstream):
+    """Why probes exist: every tool result matches, so the rebuild passes on a different database."""
+    env, ep = hidden_effect_episode(pg_image, shared_dir, upstream, {})
+    try:
+        meta = ep.run()
+    finally:
+        env.stop()
+    assert meta["status"] == "completed" and meta["resumed"]
