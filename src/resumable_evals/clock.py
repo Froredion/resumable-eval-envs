@@ -3,11 +3,21 @@
 The model proxy pins the clock each time it hands the harness a model reply:
 to the real time in the original run (and records it), to the recorded time
 on rebuild. Everything the agent does in that step (tool calls, its own shell
-commands) then sees the same time in both runs, so logs, ``date`` output
-and ``created_at`` columns match. Each process starts at the pinned instant
-and its clock runs forward from there rather than freezing, so sleeps and
-timeouts still work; monotonic clocks are left alone. A new pin takes effect
-for the next clock read, in processes already running too.
+commands, services already running) then sees the same time in both runs, so
+logs, ``date`` output and ``created_at`` columns match.
+
+Two modes:
+
+- ``frozen`` (default): wall-clock time reads exactly the pinned instant for
+  the whole step, to the nanosecond, in every process. Monotonic clocks are
+  not faked, so sleeps, ``timeout``, timers and most timeouts still work;
+  code that measures elapsed time with the wall clock sees zero.
+- ``advancing``: wall-clock time starts at the pinned instant and runs on.
+  Anything read partway through a step then depends on how long the step
+  took, so sub-second timestamps (Postgres ``now()``) differ between runs.
+
+A new pin takes effect at the next clock read, in processes already running
+too.
 
 Processes see the pinned clock when started with :meth:`Clock.env` and a
 libfaketime library to preload (``libfaketime.so.1`` in a Linux image).
@@ -35,13 +45,16 @@ from typing import Callable
 
 
 class Clock:
-    def __init__(self, path: Path | str, write: Callable[[str], None] | None = None):
+    def __init__(self, path: Path | str, write: Callable[[str], None] | None = None, mode: str = "frozen"):
         self.path = Path(path)  # where the environment's processes read it
         self._write = write or self._write_local
+        self.mode = mode
 
     def pin(self, t: float) -> None:
         """Make the environment's clock read ``t`` (epoch seconds) from now on."""
-        self._write(f"@{int(t)}\n")
+        if self.mode not in ("frozen", "advancing"):
+            raise ValueError(f"unknown clock mode {self.mode!r}")
+        self._write(f"{'@' if self.mode == 'advancing' else ''}{int(t)}\n")
 
     def _write_local(self, text: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

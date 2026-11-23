@@ -81,3 +81,45 @@ def test_container_killed_mid_episode_is_rebuilt(image, shared_dir, upstream):
         assert len(Recording(shared_dir / "episode" / "mcp-fake.jsonl").events) == 3
     finally:
         env.stop()
+
+
+PG_IMAGE = "resumable-evals-test-pg:latest"
+
+
+@pytest.fixture(scope="session")
+def pg_image():
+    subprocess.run(["docker", "build", "-q", "-t", PG_IMAGE, "-f", str(HERE / "docker" / "postgres.Dockerfile"), str(HERE)],
+                   check=True, capture_output=True)
+    return PG_IMAGE
+
+
+def test_postgres_rebuilt_by_reexecution(pg_image, shared_dir, upstream):
+    """The design's core case: a database in the environment, lost with the container, rebuilt by re-execution."""
+    env = DockerEnvironment(pg_image, f"resumable-test-pg-{shared_dir.name}")
+    ep = Episode(
+        dir=shared_dir / "episode",
+        harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
+        environment=env,
+        mcp_servers={"fake": ["python", "/opt/eval/pg_mcp_server.py"]},
+        upstream=upstream.url,
+        faketime_lib="/usr/local/lib/libfaketime.so.1",
+        timeout=180,
+        fault_after_steps=2,
+        fault="environment",
+    )
+    try:
+        meta = ep.run()
+        assert [a["outcome"] for a in meta["attempts"]] == ["failed", "completed"], meta
+        assert meta["resumed_from_steps"] == [2] and upstream.hits == 4
+
+        # Ids and created_at came back identical on the fresh database (the MCP proxy compared them),
+        # and each created_at is exactly the pinned time of the step that inserted it.
+        tool_events = Recording(shared_dir / "episode" / "mcp-fake.jsonl").events
+        step_times = [int(e.meta["t"]) for e in Recording(shared_dir / "episode" / "model.jsonl").events]
+        rows = [e.response["result"]["content"][0]["text"] for e in tool_events]
+        assert [r.split(" ", 1)[0] for r in rows] == ["1", "2", "3"]
+        final = env.exec("psql", "-h", "127.0.0.1", "-U", "postgres", "-At", "-c",
+                         "SELECT id, extract(epoch FROM created_at)::bigint FROM events ORDER BY id").split()
+        assert final == [f"{i + 1}|{t}" for i, t in enumerate(step_times[:3])]
+    finally:
+        env.stop()

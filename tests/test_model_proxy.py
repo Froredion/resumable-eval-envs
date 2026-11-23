@@ -177,12 +177,12 @@ def test_clock_pinned_to_recorded_time(tmp_path, upstream):
     call(port, msgs(1))
     proxy.httpd.shutdown()
     t = Recording(rec).events[0].meta["t"]
-    assert clock.path.read_text() == f"@{int(t)}\n"
+    assert clock.path.read_text() == f"{int(t)}\n"
 
     clock.pin(0)
     proxy, port = start(rec, upstream, clock)
     call(port, msgs(1))
-    assert clock.path.read_text() == f"@{int(t)}\n"  # rebuild pins the recorded time
+    assert clock.path.read_text() == f"{int(t)}\n"  # rebuild pins the recorded time
     proxy.httpd.shutdown()
 
 

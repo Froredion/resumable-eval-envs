@@ -58,6 +58,7 @@ class Episode:
     upstream_headers: dict[str, str] = field(default_factory=dict)  # auth the proxy adds; never enters the environment
     env: dict[str, str] = field(default_factory=dict)
     faketime_lib: str | None = None
+    clock_mode: str = "frozen"  # or "advancing"; see clock.py
     seed: int = 0
     max_attempts: int = 4
     timeout: float | None = None
@@ -98,20 +99,21 @@ class Episode:
     def _attempt(self, n: int, started: float) -> dict[str, Any]:
         recording = Recording(self.dir / "model.jsonl")
         recorded = len(recording.of_kind("model"))
-        rt = self.environment.start(self.dir)
-        clock = rt.clock
-        clock.pin(started)  # harness start-up sees the same time in every attempt
+        clock = self.environment.clock
+        clock.mode = self.clock_mode
+        clock.pin(started)  # boot and harness start-up see the same time in every attempt
+        boot_env = clock.env(self.faketime_lib, self.environment.platform) | {
+            "PYTHONHASHSEED": str(self.seed),
+            "RESUMABLE_EVALS_SEED": str(self.seed),
+        }
+        rt = self.environment.start(self.dir, boot_env)
         proxy = ModelProxy(recording, self.upstream, clock, self.upstream_headers)
         httpd = proxy.serve(self.environment.proxy_bind)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
         self._write_mcp_config(rt)
         subst = {"workdir": rt.workdir, "mcp_config": f"{rt.episode}/mcp.json", "episode": rt.episode}
-        env = clock.env(self.faketime_lib, rt.platform) | {
-            "ANTHROPIC_BASE_URL": f"http://{rt.model_host}:{httpd.server_address[1]}",
-            "PYTHONHASHSEED": str(self.seed),
-            "RESUMABLE_EVALS_SEED": str(self.seed),
-        } | self.env
+        env = boot_env | {"ANTHROPIC_BASE_URL": f"http://{rt.model_host}:{httpd.server_address[1]}"} | self.env
         argv, host_env, cwd = rt.command([a.format(**subst) for a in self.harness], env)
         record = {"attempt": n, "started": time.time(), "resumed_from_step": recorded or None}
         proc = subprocess.Popen(argv, cwd=cwd, env=host_env, stdin=subprocess.DEVNULL, start_new_session=True)
@@ -235,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--oauth-token-env", help="host env var holding a Claude OAuth token the proxy adds upstream")
     parser.add_argument("--faketime-lib", help="libfaketime library to preload into the harness and everything it starts")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="environment variable for the harness (repeat)")
+    parser.add_argument("--clock", choices=["frozen", "advancing"], default="frozen", help="pinned clock mode (see clock.py)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-attempts", type=int, default=4)
     parser.add_argument("--timeout", type=float, help="seconds per attempt")
@@ -265,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     episode = Episode(
         dir=args.episode, harness=cmd, environment=environment, mcp_servers=servers, upstream=args.upstream,
         env=dict(kv.partition("=")[::2] for kv in args.env),
-        upstream_headers=headers, faketime_lib=args.faketime_lib, seed=args.seed, max_attempts=args.max_attempts,
+        upstream_headers=headers, faketime_lib=args.faketime_lib, clock_mode=args.clock, seed=args.seed, max_attempts=args.max_attempts,
         timeout=args.timeout, rerun_on_divergence=not args.no_rerun_on_divergence,
         fault_after_steps=args.fault_after_steps, fault=args.fault,
     )

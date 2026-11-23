@@ -1,18 +1,20 @@
 from resumable_evals.clock import Clock
 
 
-def test_pin_writes_libfaketime_start_time(tmp_path):
+def test_pin_writes_libfaketime_time(tmp_path):
     c = Clock(tmp_path / "clock")
     c.pin(1700000000.9)
-    assert c.path.read_text() == "@1700000000\n"
+    assert c.path.read_text() == "1700000000\n"  # frozen: absolute time
     assert not (tmp_path / "clock.tmp").exists()
+    Clock(c.path, mode="advancing").pin(1700000000)
+    assert c.path.read_text() == "@1700000000\n"  # advancing: start-at time
 
 
 def test_pin_through_a_custom_writer(tmp_path):
     written = []
     c = Clock("/run/resumable-evals/clock", written.append)
     c.pin(1700000000)
-    assert written == ["@1700000000\n"] and c.env()["FAKETIME_TIMESTAMP_FILE"] == "/run/resumable-evals/clock"
+    assert written == ["1700000000\n"] and c.env()["FAKETIME_TIMESTAMP_FILE"] == "/run/resumable-evals/clock"
 
 
 def test_env_points_libfaketime_at_the_file(tmp_path):
