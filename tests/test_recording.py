@@ -18,3 +18,15 @@ def test_torn_final_line_is_dropped(tmp_path):
     with p.open("ab") as f:
         f.write(b'{"seq":1,"step":1,"kind":"to')
     assert len(Recording(p).events) == 1
+
+
+def test_append_after_torn_line_stays_readable(tmp_path):
+    p = tmp_path / "ep.jsonl"
+    Recording(p).append(0, "tool", {"tool": "ls"}, "a.txt")
+    with p.open("ab") as f:
+        f.write(b'{"seq":1,"step":1,"kind":"to')
+    resumed = Recording(p)
+    resumed.append(1, "tool", {"tool": "cat"}, "hello")
+    again = Recording(p)
+    assert [e.request["tool"] for e in again.events] == ["ls", "cat"]
+    assert [e.seq for e in again.events] == [0, 1]

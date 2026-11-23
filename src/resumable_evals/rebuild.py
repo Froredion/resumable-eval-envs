@@ -41,6 +41,10 @@ class RebuildCursor:
     def resumed_from_step(self) -> int:
         return self.recording.last_step + 1
 
+    def peek_model(self) -> Event | None:
+        """Recorded event the next model request will be answered from, or None once live."""
+        return self._models[self._model_i] if self._model_i < len(self._models) else None
+
     def next_model_reply(self) -> Any | None:
         """Recorded reply for the next model request, or None once live."""
         if self._model_i >= len(self._models):
@@ -54,13 +58,22 @@ class RebuildCursor:
             return None
         return self._tools[self._tool_i]
 
+    def expect_tool(self, request: Any) -> Event | None:
+        """Recorded event this request must replay, or None once live.
+
+        Raises Diverged if the request is not the next recorded one, so the
+        caller can refuse to execute it against the environment at all.
+        """
+        event = self.next_tool_call()
+        if event is not None and request != event.request:
+            raise Diverged(event, f"request differs: recorded {event.request!r}, got {request!r}")
+        return event
+
     def check_tool(self, request: Any, result: Any) -> None:
         """Check a re-executed tool call against the recording; raise Diverged on mismatch."""
-        event = self.next_tool_call()
+        event = self.expect_tool(request)
         if event is None:
             return  # live
-        if request != event.request:
-            raise Diverged(event, f"request differs: recorded {event.request!r}, got {request!r}")
         mismatch = compare(event.response, result)
         if mismatch:
             raise Diverged(event, mismatch)

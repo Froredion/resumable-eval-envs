@@ -36,11 +36,19 @@ class Recording:
     def _load(self) -> Iterator[Event]:
         if not self.path.exists():
             return
+        good = 0
         with self.path.open("rb") as f:
             for raw in f:
                 if not raw.endswith(b"\n"):
                     break  # torn final write
                 yield Event(**json.loads(raw))
+                good += len(raw)
+        if good < self.path.stat().st_size:
+            # Drop the torn tail so the next append starts on a clean line.
+            with self.path.open("r+b") as f:
+                f.truncate(good)
+                f.flush()
+                os.fsync(f.fileno())
 
     @property
     def last_step(self) -> int:

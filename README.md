@@ -11,13 +11,13 @@ Environments are offline and their tools deterministic, so nothing is snapshotte
 | `src/resumable_evals/recording.py` | Append-only, fsynced JSONL recording store (one file per episode) |
 | `src/resumable_evals/compare.py` | Normalizes volatile fields and compares a re-executed tool result to its recording |
 | `src/resumable_evals/rebuild.py` | Rebuild cursor: serves recorded model replies by step, checks re-executed tool results, decides when to go live |
-| `src/resumable_evals/model_proxy.py` | Model API proxy (stub) |
-| `src/resumable_evals/mcp_proxy.py` | MCP proxy (stub) |
+| `src/resumable_evals/model_proxy.py` | Model proxy for the Anthropic Messages API: records replies, replays them in order on rebuild |
+| `src/resumable_evals/mcp_proxy.py` | MCP proxy for stdio servers: records tool calls, re-executes and checks them on rebuild |
 | `docs/DESIGN.md` | Design doc |
 
 ## Status
 
-Rollout step 1 (prototype) in progress. The recording store, comparison and rebuild cursor work and are tested. The two proxies are not written yet.
+Rollout step 1 (prototype) in progress. The recording store, comparison, rebuild cursor, stdio MCP proxy and Anthropic model proxy work and are tested; the model proxy has recorded and replayed a real Claude Code session. The orchestrator (rollout step 3) and determinism controls (step 2) are not written yet.
 
 ## Development
 
