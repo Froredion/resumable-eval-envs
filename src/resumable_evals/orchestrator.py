@@ -15,6 +15,8 @@ An attempt ends one of three ways:
   non-zero, or the attempt timed out. The next
   attempt rebuilds: same recordings, fresh environment; the proxies replay
   and check up to where the failure happened, then go live.
+- **auth_failed**: the model API rejected the credential. The episode stops;
+  rebuilding cannot fix that.
 - **diverged**: a proxy found a re-executed result that does not match the
   recording. The harness is stopped. With ``rerun_on_divergence`` the
   recordings are moved to ``diverged-<attempt>/`` and the episode reruns
@@ -78,6 +80,8 @@ class Episode:
             meta["attempts"].append(attempt)
             if attempt["outcome"] == "completed":
                 meta["status"] = "completed"
+            elif attempt["outcome"] == "auth_failed":
+                meta["status"] = "auth_failed"
             elif attempt["outcome"] == "diverged":
                 if self.rerun_on_divergence:
                     self._archive(attempt["attempt"])
@@ -148,6 +152,9 @@ class Episode:
             record |= {"outcome": "diverged", "reason": "rebuild diverged", "divergence": reports}
         elif reason is None and proc.returncode == 0:
             record |= {"outcome": "completed", "reason": None}
+        elif proxy.auth_failed and reason is None:
+            # Rebuilding cannot fix a credential; stop rather than retry.
+            record |= {"outcome": "auth_failed", "reason": f"model API rejected the credential ({proxy.auth_failed})"}
         else:
             if reason is None:
                 reason = "environment died" if not self.environment.alive() else f"harness exited {proc.returncode}"
@@ -261,10 +268,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         parser.error("give --image, or --base and --workdir")
     headers = {}
+    # pop: read once, then gone from this process's environment, so nothing it starts inherits the credential
     if args.api_key_env:
-        headers = api_key_headers(os.environ[args.api_key_env])
+        headers = api_key_headers(os.environ.pop(args.api_key_env))
     elif args.oauth_token_env:
-        headers = oauth_headers(os.environ[args.oauth_token_env])
+        headers = oauth_headers(os.environ.pop(args.oauth_token_env))
     episode = Episode(
         dir=args.episode, harness=cmd, environment=environment, mcp_servers=servers, upstream=args.upstream,
         env=dict(kv.partition("=")[::2] for kv in args.env),

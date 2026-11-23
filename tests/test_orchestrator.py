@@ -19,6 +19,7 @@ class Upstream:
 
     def __init__(self):
         self.hits = 0
+        self.status = 200
         up = self
 
         class H(BaseHTTPRequestHandler):
@@ -34,8 +35,10 @@ class Upstream:
                     reply = {"content": content, "stop_reason": "tool_use"}
                 else:
                     reply = {"content": [{"type": "text", "text": "counted"}], "stop_reason": "end_turn"}
+                if up.status != 200:
+                    reply = {"type": "error", "error": {"type": "authentication_error", "message": "invalid"}}
                 data = json.dumps(reply).encode()
-                self.send_response(200)
+                self.send_response(up.status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -143,3 +146,9 @@ def test_timeout_counts_as_failure(tmp_path, base, upstream):
     meta = ep.run()
     assert meta["status"] == "failed"
     assert [a["reason"] for a in meta["attempts"]] == ["timeout after 0.5s"] * 2
+
+
+def test_auth_failure_stops_the_episode(tmp_path, base, upstream):
+    upstream.status = 401
+    meta = episode(tmp_path, base, upstream).run()
+    assert meta["status"] == "auth_failed" and len(meta["attempts"]) == 1

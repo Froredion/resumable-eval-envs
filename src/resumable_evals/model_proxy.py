@@ -123,6 +123,7 @@ class ModelProxy:
         self._lock = threading.Lock()
         self._steps = len(recording.of_kind("model"))
         self.diverged: Diverged | None = None
+        self.auth_failed: int | None = None  # status of the last upstream auth failure on a model call
         self.httpd: ThreadingHTTPServer | None = None
 
     @property
@@ -180,6 +181,7 @@ class ModelProxy:
                     self.clock.pin(event.meta["t"])
                 return reply["status"], [("Content-Type", reply["content_type"])], reply["body"].encode()
             status, out, data = self.forward("POST", path, headers, raw)
+            self.auth_failed = status if status in (401, 403) else None
             if not unrecorded(status):
                 t = time.time()
                 content_type = next((v for k, v in out if k.lower() == "content-type"), "application/json")
