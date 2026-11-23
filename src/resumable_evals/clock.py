@@ -11,7 +11,8 @@ for the next clock read, in processes already running too.
 
 Processes see the pinned clock when started with :meth:`Clock.env` and a
 libfaketime library to preload (``libfaketime.so.1`` in a Linux image).
-Checked with libfaketime 0.9.10 on Debian.
+Checked with libfaketime 0.9.10 (Debian) and 0.9.14 (built from source,
+which Claude Code needs; see examples/claude-code/Dockerfile).
 
 The file must live where the environment's processes read it reliably. In a
 container that means the container's own filesystem, written with
@@ -59,6 +60,10 @@ class Clock:
             "FAKETIME_FMT": "%s",
             "FAKETIME_NO_CACHE": "1",  # re-read the file so each pin takes effect
             "FAKETIME_DONT_FAKE_MONOTONIC": "1",
+            # >= 0.9.11; older versions ignore it. Without it, a program that
+            # re-execs itself under the same PID (Claude Code does) fails to
+            # create libfaketime's per-PID semaphore and exits.
+            "FAKETIME_DISABLE_SHM": "1",
         }
         if lib:
             if platform == "darwin":

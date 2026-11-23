@@ -30,7 +30,8 @@ and appends request and full reply (fsynced) before the reply reaches the
 harness. To make that ordering hold, streamed replies are buffered and sent
 whole rather than relayed incrementally. Transient failures (408, 429, 5xx)
 are not recorded: the harness retries them with the same request, so the
-rebuild needs only the reply to the retry.
+rebuild needs only the reply to the retry. Auth failures (401, 403) are not
+recorded either: they depend on the credential, not on the episode.
 
 Auth headers (``x-api-key``, OAuth ``Authorization: Bearer``) are never
 recorded; a rebuild does not need them until it goes live. By default the
@@ -90,8 +91,11 @@ def tool_results(body: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def transient(status: int) -> bool:
-    return status in (408, 429) or status >= 500
+def unrecorded(status: int) -> bool:
+    """Failures that say nothing about the episode: transient ones the harness
+    retries, and auth failures that depend on the credential. Replaying either
+    would repeat a failure the rebuild has no reason to repeat."""
+    return status in (401, 403, 408, 429) or status >= 500
 
 
 def _error(status: int, message: str, kind: str = "api_error") -> Response:
@@ -176,7 +180,7 @@ class ModelProxy:
                     self.clock.pin(event.meta["t"])
                 return reply["status"], [("Content-Type", reply["content_type"])], reply["body"].encode()
             status, out, data = self.forward("POST", path, headers, raw)
-            if not transient(status):
+            if not unrecorded(status):
                 t = time.time()
                 content_type = next((v for k, v in out if k.lower() == "content-type"), "application/json")
                 self.recording.append(

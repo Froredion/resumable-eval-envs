@@ -234,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--api-key-env", help="host env var holding an Anthropic API key the proxy adds upstream")
     parser.add_argument("--oauth-token-env", help="host env var holding a Claude OAuth token the proxy adds upstream")
     parser.add_argument("--faketime-lib", help="libfaketime library to preload into the harness and everything it starts")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="environment variable for the harness (repeat)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-attempts", type=int, default=4)
     parser.add_argument("--timeout", type=float, help="seconds per attempt")
@@ -263,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         headers = oauth_headers(os.environ[args.oauth_token_env])
     episode = Episode(
         dir=args.episode, harness=cmd, environment=environment, mcp_servers=servers, upstream=args.upstream,
+        env=dict(kv.partition("=")[::2] for kv in args.env),
         upstream_headers=headers, faketime_lib=args.faketime_lib, seed=args.seed, max_attempts=args.max_attempts,
         timeout=args.timeout, rerun_on_divergence=not args.no_rerun_on_divergence,
         fault_after_steps=args.fault_after_steps, fault=args.fault,

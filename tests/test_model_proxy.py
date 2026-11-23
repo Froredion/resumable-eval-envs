@@ -117,12 +117,13 @@ def test_shape_divergence_stops_proxy(tmp_path, upstream):
     assert proxy.diverged and len(upstream.hits) == 1
 
 
-def test_transient_failures_are_not_recorded(tmp_path, upstream):
+def test_transient_and_auth_failures_are_not_recorded(tmp_path, upstream):
     rec = tmp_path / "model.jsonl"
-    upstream.fail_next = [529]
+    upstream.fail_next = [529, 401]
     proxy, port = start(rec, upstream)
     assert call(port, msgs(1))[0] == 529
-    assert call(port, msgs(1))[0] == 200  # harness retry
+    assert call(port, msgs(1))[0] == 401  # bad credential
+    assert call(port, msgs(1))[0] == 200  # harness retry, credential fixed
     proxy.httpd.shutdown()
     assert [e.response["status"] for e in Recording(rec).events] == [200]
 

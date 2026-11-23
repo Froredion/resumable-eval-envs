@@ -40,7 +40,7 @@ Rollout steps 1–3 (prototype, determinism controls, orchestrator) work locally
 - **Model replies are matched by order**, with a shape check (model, stream flag, message count) and a check of the tool results the harness reports in each request. The latter is what covers Claude Code's built-in tools (Bash, Write), which never pass through the MCP proxy.
 - **Streamed replies are buffered**, so a reply is fsynced before the harness sees any of it. The harness gets the stream all at once.
 - **Model calls and MCP tool calls run one at a time**, in the original run too. Parallel subagents with the same model and message count could be mis-paired on replay; avoid them for now.
-- **Transient model errors (408, 429, 5xx) are not recorded**; the harness retries them. Other errors are recorded, since the harness reacts to them.
+- **Transient model errors (408, 429, 5xx) and auth errors (401, 403) are not recorded**; the harness retries the first, and the second depend on the credential. Other errors are recorded, since the harness reacts to them.
 - **Clock:** pinned per model step via libfaketime (checked in a Debian container). File modification times are not faked. On Docker Desktop for macOS the clock file must be in a shared directory (under `$HOME`).
 - **Randomness:** only `PYTHONHASHSEED` and `RESUMABLE_EVALS_SEED` are set. Pinning UUIDs and temp names is per environment and not done.
 - **Divergence** is reported in `<recording>.diverged.json` and in `episode.json`. By default the episode is then rerun from scratch (`reran_after_divergence: true`), with the diverged recordings kept in `diverged-<attempt>/`.
