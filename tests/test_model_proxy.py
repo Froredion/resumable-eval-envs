@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from resumable_evals.clock import Clock
 from resumable_evals.model_proxy import ModelProxy
 from resumable_evals.recording import Recording
 
@@ -57,8 +58,8 @@ def upstream():
     up.httpd.shutdown()
 
 
-def start(rec, upstream):
-    proxy = ModelProxy(Recording(rec), upstream.url)
+def start(rec, upstream, clock=None):
+    proxy = ModelProxy(Recording(rec), upstream.url, clock)
     httpd = proxy.serve()
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return proxy, httpd.server_address[1]
@@ -109,7 +110,7 @@ def test_shape_divergence_stops_proxy(tmp_path, upstream):
     status, _, body = call(port, msgs(1), model="claude-haiku-5-5")  # e.g. a side call arrived first
     assert status == 400 and "diverged" in json.loads(body)["error"]["message"]
     report = json.loads((tmp_path / "model.jsonl.diverged.json").read_text())
-    assert report["recorded_shape"]["model"] == "claude-opus-5-5"
+    assert "claude-opus-5-5" in report["detail"] and "claude-haiku-5-5" in report["detail"]
     assert proxy.diverged and len(upstream.hits) == 1
 
 
@@ -141,3 +142,41 @@ def test_other_endpoints_pass_through_unrecorded(tmp_path, upstream):
     proxy.httpd.shutdown()
     assert status == 200 and json.loads(body) == {"data": []}
     assert Recording(rec).events == []
+
+
+def tool_turn(n, result):
+    """n messages, the last reporting a tool result (as Claude Code does after running Bash)."""
+    m = msgs(n - 1)
+    m.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": result}]})
+    return m
+
+
+def test_harness_tool_results_are_checked(tmp_path, upstream):
+    rec = tmp_path / "model.jsonl"
+    proxy, port = start(rec, upstream)
+    call(port, tool_turn(3, "3 passed in 0.52s"))
+    proxy.httpd.shutdown()
+
+    proxy, port = start(rec, upstream)
+    assert call(port, tool_turn(3, "3 passed in 0.61s"))[0] == 200  # duration normalized
+    proxy.httpd.shutdown()
+
+    proxy, port = start(rec, upstream)
+    status, _, body = call(port, tool_turn(3, "1 failed, 2 passed in 0.5s"))
+    assert status == 400 and "tool results differ" in json.loads(body)["error"]["message"]
+    assert proxy.diverged
+
+
+def test_clock_pinned_to_recorded_time(tmp_path, upstream):
+    rec, clock = tmp_path / "model.jsonl", Clock(tmp_path / "clock")
+    proxy, port = start(rec, upstream, clock)
+    call(port, msgs(1))
+    proxy.httpd.shutdown()
+    t = Recording(rec).events[0].meta["t"]
+    assert clock.path.read_text() == f"@{int(t)}\n"
+
+    clock.pin(0)
+    proxy, port = start(rec, upstream, clock)
+    call(port, msgs(1))
+    assert clock.path.read_text() == f"@{int(t)}\n"  # rebuild pins the recorded time
+    proxy.httpd.shutdown()

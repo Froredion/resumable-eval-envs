@@ -14,8 +14,16 @@ harness fast-forwards. Replies are matched by order, not content (harnesses
 put timestamps and ids in prompts), but the request's *shape* (model, stream
 flag, number of messages) must equal the recorded one, which catches
 reordered side calls and a harness that has already gone a different way.
-On a shape mismatch the harness gets a non-retryable 400, details go to
-``<recording>.diverged.json`` and the proxy stops with status 3.
+
+The tool results in the request's last message must also match the recorded
+ones (after normalization). This is the per-step check for tools the harness
+runs itself, such as Claude Code's Bash and Write, which never pass through
+the MCP proxy. On any mismatch the harness gets a non-retryable 400, details
+go to ``<recording>.diverged.json`` and the proxy stops with status 3.
+
+With a :class:`~resumable_evals.clock.Clock`, each reply pins the
+environment's clock: to now when live (recorded with the event), to the
+recorded time on rebuild.
 
 Once the recording is exhausted the proxy is live: it forwards the request,
 and appends request and full reply (fsynced) before the reply reaches the
@@ -36,13 +44,15 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .rebuild import Diverged
-from .rebuild import RebuildCursor
+from .clock import Clock
+from .compare import compare
+from .rebuild import Diverged, RebuildCursor
 from .recording import Recording
 
 DIVERGED_EXIT = 3
@@ -62,6 +72,20 @@ def shape(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def tool_results(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """Tool results the harness is reporting in this request (its last message)."""
+    messages = body.get("messages") or []
+    last = messages[-1] if messages else {}
+    content = last.get("content") if isinstance(last, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [
+        {"content": b.get("content"), "is_error": bool(b.get("is_error"))}
+        for b in content
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
+
+
 def transient(status: int) -> bool:
     return status in (408, 429) or status >= 500
 
@@ -72,8 +96,9 @@ def _error(status: int, message: str, kind: str = "api_error") -> Response:
 
 
 class ModelProxy:
-    def __init__(self, recording: Recording, upstream: str = "https://api.anthropic.com"):
+    def __init__(self, recording: Recording, upstream: str = "https://api.anthropic.com", clock: Clock | None = None):
         self.recording = recording
+        self.clock = clock
         self.cursor = RebuildCursor(recording)
         u = urlsplit(upstream)
         self._https = u.scheme == "https"
@@ -116,27 +141,35 @@ class ModelProxy:
             event = self.cursor.peek_model()
             if event is not None:
                 if event.request["shape"] != shape(body):
-                    return self._diverge(event, body)
+                    return self._diverge(event, f"request shape differs: recorded {event.request['shape']}, got {shape(body)}")
+                mismatch = compare(tool_results(event.request["body"]), tool_results(body))
+                if mismatch:
+                    return self._diverge(event, f"tool results differ: {mismatch}")
                 reply = self.cursor.next_model_reply()
+                if self.clock and "t" in event.meta:
+                    self.clock.pin(event.meta["t"])
                 return reply["status"], [("Content-Type", reply["content_type"])], reply["body"].encode()
             status, out, data = self.forward("POST", path, headers, raw)
             if not transient(status):
+                t = time.time()
                 content_type = next((v for k, v in out if k.lower() == "content-type"), "application/json")
                 self.recording.append(
                     self._steps,
                     "model",
                     {"path": path, "shape": shape(body), "body": body},
                     {"status": status, "content_type": content_type, "body": data.decode()},
+                    t=t,
                 )
                 self._steps += 1
+                if self.clock:
+                    self.clock.pin(t)
             return status, out, data
 
-    def _diverge(self, event: Any, body: dict[str, Any]) -> Response:
-        d = Diverged(event, f"request shape differs: recorded {event.request['shape']}, got {shape(body)}")
+    def _diverge(self, event: Any, detail: str) -> Response:
+        d = Diverged(event, detail)
         self.diverged = d
         with self.diverged_path.open("w") as f:
-            json.dump({"seq": event.seq, "step": event.step, "recorded_shape": event.request["shape"],
-                       "shape": shape(body), "detail": str(d)}, f, indent=2)
+            json.dump({"seq": event.seq, "step": event.step, "detail": detail}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         print(f"resumable-evals: rebuild {d}", file=sys.stderr)
@@ -179,8 +212,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--upstream", default="https://api.anthropic.com")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument("--clock-file", type=Path, help="libfaketime timestamp file to pin at each step")
     args = parser.parse_args(argv)
-    proxy = ModelProxy(Recording(args.recording), args.upstream)
+    clock = Clock(args.clock_file) if args.clock_file else None
+    proxy = ModelProxy(Recording(args.recording), args.upstream, clock)
     httpd = proxy.serve(args.host, args.port)
     print(f"resumable-evals: model proxy on http://{args.host}:{httpd.server_address[1]}", file=sys.stderr)
     try:
