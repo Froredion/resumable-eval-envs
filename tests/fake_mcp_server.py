@@ -28,9 +28,13 @@ for line in sys.stdin:
         continue  # notification
     method = msg["method"]
     if method == "initialize":
-        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake"}}
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "0"}}
     elif method == "tools/list":
-        result = {"tools": [{"name": "incr"}, {"name": "echo"}]}
+        schema = {"type": "object", "properties": {}}
+        result = {"tools": [
+            {"name": "incr", "description": "Increment the counter and return its new value.", "inputSchema": schema},
+            {"name": "echo", "description": "Return the given text.", "inputSchema": schema},
+        ]}
     elif method == "tools/call":
         result = call(msg["params"]["name"], msg["params"].get("arguments", {}))
     else:

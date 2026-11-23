@@ -136,7 +136,8 @@ class Episode:
             "RESUMABLE_EVALS_SEED": str(self.seed),
         } | self.env
         record = {"attempt": n, "started": time.time(), "resumed_from_step": recorded or None}
-        proc = subprocess.Popen([a.format(**subst) for a in self.harness], cwd=workdir, env=env, start_new_session=True)
+        proc = subprocess.Popen([a.format(**subst) for a in self.harness], cwd=workdir, env=env,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
 
         reason: str | None = None
         if self.fault_after_steps is not None and n == 0:

@@ -210,7 +210,15 @@ class ModelProxy:
             def log_message(self, *args: Any) -> None:
                 pass
 
-        self.httpd = ThreadingHTTPServer((host, port), Handler)
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def handle_error(self, request: Any, client_address: Any) -> None:
+                if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):
+                    return  # harness went away (crashed or killed); nothing to report
+                super().handle_error(request, client_address)
+
+        self.httpd = Server((host, port), Handler)
         return self.httpd
 
 
