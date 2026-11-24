@@ -178,3 +178,18 @@ def test_random_shim_refused_on_macos(tmp_path, base, upstream):
 def test_settling_needs_a_container(tmp_path, base, upstream):
     with pytest.raises(ValueError, match="only a container"):
         episode(tmp_path, base, upstream, settle_timeout=30).run()
+
+
+def test_cli_builds_the_container_environment(tmp_path, monkeypatch):
+    from resumable_evals import orchestrator
+    seen = {}
+    monkeypatch.setattr(orchestrator.Episode, "run", lambda self: seen.setdefault("ep", self) and {"status": "completed"})
+    orchestrator.main(["--episode", str(tmp_path / "ep"), "--image", "img", "--workdir", "/w", "--proxy-bind", "172.17.0.1",
+                       "--volume", "pgdata=/var/lib/postgresql/data", "--docker-arg=--memory=1g",
+                       "--random-lib", "/r.so", "--ready", "pg_isready", "--", "harness"])
+    ep = seen["ep"]
+    env = ep.environment
+    assert (env.image, env.workdir, env.run_args, env.volumes, env.proxy_bind) == (
+        "img", "/w", ["--memory=1g"], {"pgdata": "/var/lib/postgresql/data"}, "172.17.0.1")
+    assert ep.random_lib == "/r.so" and ep.ready == ["sh", "-c", "pg_isready"] and ep.settle_timeout == 30
+    assert ep.harness == ["harness"]

@@ -385,8 +385,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.image:
         name = args.name or f"resumable-{args.episode.resolve().name}"
         volumes = dict(v.partition("=")[::2] for v in args.volume)
-        environment: Environment = DockerEnvironment(args.image, name, args.workdir or "/work", args.docker_arg,
-                                                     args.proxy_bind, volumes)
+        environment: Environment = DockerEnvironment(args.image, name, workdir=args.workdir or "/work",
+                                                     run_args=args.docker_arg, volumes=volumes,
+                                                     proxy_bind=args.proxy_bind)
     elif args.base and args.workdir:
         environment = DirEnvironment(args.base, Path(args.workdir))
     else:
