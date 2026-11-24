@@ -43,6 +43,15 @@ own commands alike), its result is recorded with the step, and on rebuild
 it must match. That catches side effects no tool result shows, such as a
 database row written with a different value.
 
+With a ``processes`` lister (the environment's running processes), the
+list is recorded with each reply as it comes back from upstream: it shows
+which background jobs the agent started had finished by then. On rebuild,
+a reply is held until every process not on its recorded list has exited,
+up to ``settle_timeout`` seconds, so the agent's next tools see the jobs
+done, as they did in the original run, however much faster the replay
+is. A timeout is noted in ``settle_timeouts`` and the replay carries on;
+the result checks still decide.
+
 With a :class:`~resumable_evals.clock.Clock`, each reply pins the
 environment's clock: to now when live (recorded with the event), to the
 recorded time on rebuild.
@@ -72,6 +81,7 @@ import os
 import sys
 import threading
 import time
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -171,6 +181,9 @@ class ModelProxy:
         self.clock = clock
         self.upstream_headers = upstream_headers or {}
         self.state_probe: Callable[[], dict[str, Any]] | None = None  # see the module docstring
+        self.processes: Callable[[], list[str]] | None = None  # see the module docstring
+        self.settle_timeout = 30.0
+        self.settle_timeouts: list[dict[str, Any]] = []
         self.on_record: Callable[[int], None] | None = None  # called with the step count after each live reply is recorded
         self.cursor = RebuildCursor(recording)
         u = urlsplit(upstream)
@@ -263,6 +276,8 @@ class ModelProxy:
                 if differing:
                     return self._diverge(event, f"environment state differs: {', '.join(differing)}",
                                          {"recorded_state": event.meta["state"], "state": state})
+            if self.processes and "processes" in event.meta:
+                self._settle(event)
             reply = self.cursor.take_model(event)
             if self.clock and "t" in event.meta:
                 self.clock.pin(event.meta["t"])
@@ -271,6 +286,7 @@ class ModelProxy:
         status, out, data = self.forward("POST", path, headers, raw)
         self.auth_failed = status if status in (401, 403) else None
         if not unrecorded(status):
+            processes = self.processes() if self.processes and not overlaps else None
             t = time.time()
             content_type = next((v for k, v in out if k.lower() == "content-type"), "application/json")
             self.recording.append(
@@ -280,6 +296,7 @@ class ModelProxy:
                 {"status": status, "content_type": content_type, "body": data.decode()},
                 t=t,
                 **({"state": state} if state is not None else {}),
+                **({"processes": processes} if processes is not None else {}),
                 **({"overlaps_previous": True} if overlaps else {}),
             )
             self._steps += 1
@@ -288,6 +305,16 @@ class ModelProxy:
             if self.on_record:
                 self.on_record(self._steps)
         return status, out, data
+
+    def _settle(self, event: Any) -> None:
+        """Hold the reply until no process runs that had exited by this point in the original run."""
+        recorded = Counter(event.meta["processes"])
+        deadline = time.monotonic() + self.settle_timeout
+        while extra := Counter(self.processes()) - recorded:
+            if time.monotonic() > deadline:
+                self.settle_timeouts.append({"step": event.step, "still_running": sorted(extra.elements())})
+                return
+            time.sleep(0.2)
 
     def _diverge(self, event: Any, detail: str, extra: dict[str, Any] | None = None) -> Response:
         d = Diverged(event, detail)

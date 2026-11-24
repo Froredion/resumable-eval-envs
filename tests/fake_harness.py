@@ -5,7 +5,8 @@ for: ``incr`` through the MCP server named ``fake`` in the MCP config given
 as argv[1], and two tools of its own, like Claude Code's Bash and Write:
 ``clock`` reads the clock (``date`` when libfaketime is preloaded, else the
 pinned clock file) and ``note`` appends to notes.txt in the working
-directory. Crashes once, partway through a step, if $CRASH_MARKER
+directory. ``bg`` starts a job in the background that writes bg.txt a
+second later, and ``read`` reports bg.txt. Crashes once, partway through a step, if $CRASH_MARKER
 names an existing file and the step is $CRASH_AT_STEP.
 """
 
@@ -77,6 +78,11 @@ while True:
                 text = subprocess.run(["date", "-u", "+%s"], capture_output=True, text=True).stdout
             else:
                 text = Path(os.environ["FAKETIME_TIMESTAMP_FILE"]).read_text()
+        elif block["name"] == "bg":
+            subprocess.Popen(["sh", "-c", "sleep 1; echo done > bg.txt"], start_new_session=True)
+            text = "started"
+        elif block["name"] == "read":
+            text = Path("bg.txt").read_text() if Path("bg.txt").exists() else "missing"
         elif block["name"] == "note":
             with open("notes.txt", "a") as f:
                 f.write(f"step {step}\n")

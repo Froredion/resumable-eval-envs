@@ -1,6 +1,7 @@
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -15,11 +16,16 @@ MCP = {"fake": [sys.executable, str(HERE / "fake_mcp_server.py"), "{workdir}/app
 
 
 class Upstream:
-    """Stateless scripted model: three steps of [incr, clock, note], then end_turn."""
+    """Stateless scripted model: by default three steps of [incr, clock, note], then end_turn.
 
-    def __init__(self):
+    ``script`` gives the tools of each step instead; ``delay`` is the model's latency.
+    """
+
+    def __init__(self, script=None, delay=0.0):
         self.hits = 0
         self.status = 200
+        self.script = script or [["incr", "clock", "note"]] * 3
+        self.delay = delay
         up = self
 
         class H(BaseHTTPRequestHandler):
@@ -28,10 +34,11 @@ class Upstream:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 up.hits += 1
+                time.sleep(up.delay)
                 n = len(body["messages"])
-                if n < 7:
+                if (n - 1) // 2 < len(up.script):
                     content = [{"type": "tool_use", "id": f"toolu_{n}_{i}", "name": t, "input": {}}
-                               for i, t in enumerate(["incr", "clock", "note"])]
+                               for i, t in enumerate(up.script[(n - 1) // 2])]
                     reply = {"content": content, "stop_reason": "tool_use"}
                 else:
                     reply = {"content": [{"type": "text", "text": "counted"}], "stop_reason": "end_turn"}
@@ -166,3 +173,8 @@ def test_random_shim_refused_on_macos(tmp_path, base, upstream):
     ep.environment.platform = "darwin"
     with pytest.raises(ValueError, match="cannot run on macOS"):
         ep.run()
+
+
+def test_settling_needs_a_container(tmp_path, base, upstream):
+    with pytest.raises(ValueError, match="only a container"):
+        episode(tmp_path, base, upstream, settle_timeout=30).run()

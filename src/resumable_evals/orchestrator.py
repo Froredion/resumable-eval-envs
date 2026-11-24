@@ -53,6 +53,26 @@ from .model_proxy import ModelProxy
 from .recording import Recording
 
 
+# Lists /proc inside the environment: every process but itself, by command line.
+# Zombies and kernel threads have none. Ports in rewritten titles (a Postgres
+# backend's "127.0.0.1(54321)") differ between runs and are masked.
+PROCESS_LIST = r"""
+import json, os, re
+out = []
+for pid in os.listdir("/proc"):
+    if not pid.isdigit() or int(pid) == os.getpid():
+        continue
+    try:
+        cmd = open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        continue
+    cmd = cmd.replace(b"\0", b" ").decode(errors="replace").strip()
+    if cmd:
+        out.append(re.sub(r"\(\d+\)", "(N)", cmd))
+print(json.dumps(sorted(out)))
+"""
+
+
 @dataclass
 class Episode:
     dir: Path
@@ -69,6 +89,9 @@ class Episode:
     # (Postgres) finishes under the start pin in every attempt instead of racing the first steps
     ready: list[str] | None = None
     ready_timeout: float = 120
+    # Docker only: hold each replayed reply until background jobs that had finished by then in the
+    # original run have finished again, waiting at most this long (see model_proxy.py); None: off
+    settle_timeout: float | None = None
     clock_mode: str = "frozen"  # or "advancing"; see clock.py
     seed: int = 0
     max_attempts: int = 4
@@ -82,6 +105,8 @@ class Episode:
         return self.dir / "episode.json"
 
     def run(self) -> dict[str, Any]:
+        if self.settle_timeout is not None and not isinstance(self.environment, DockerEnvironment):
+            raise ValueError("settling lists the environment's processes; only a container has its own")
         if self.random_lib and self.environment.platform == "darwin":
             raise ValueError("the randomness shim is an ELF preload library; it cannot run on macOS")
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -137,6 +162,9 @@ class Episode:
         proxy = ModelProxy(recording, self.upstream, clock, self.upstream_headers)
         if self.state_probes:
             proxy.state_probe = lambda: self._probe(rt, boot_env)
+        if self.settle_timeout is not None:
+            proxy.processes = lambda: self._processes(rt)
+            proxy.settle_timeout = self.settle_timeout
         httpd = proxy.serve(self.environment.proxy_bind)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
@@ -173,6 +201,8 @@ class Episode:
 
         reports = self._divergence_reports()
         record |= {"ended": time.time(), "exit_code": proc.returncode, "model_steps": proxy.steps}
+        if proxy.settle_timeouts:
+            record["settle_timeouts"] = proxy.settle_timeouts
         if self.random_lib:
             fallbacks = self._random_fallbacks(rt)
             if fallbacks:
@@ -218,6 +248,12 @@ class Episode:
                 return True
             time.sleep(0.2)
         return False
+
+    def _processes(self, rt: Runtime) -> list[str]:
+        """Command lines of the processes running in the environment, sorted."""
+        cmd, host_env, cwd = rt.command([*rt.python, "-c", PROCESS_LIST], {})
+        p = subprocess.run(cmd, env=host_env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        return json.loads(p.stdout) if p.returncode == 0 else ["<process list failed>"]
 
     def _end_boot(self, rt: Runtime) -> None:
         """Tell the randomness shim the harness is starting: draws from here on
@@ -321,6 +357,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ready", metavar="COMMAND",
                         help="command run inside the environment until it succeeds, before the harness starts")
     parser.add_argument("--ready-timeout", type=float, default=120)
+    parser.add_argument("--settle-timeout", type=float, default=30,
+                        help="with --image: seconds a replayed reply waits for background jobs to finish as they had "
+                             "in the original run (0: don't wait)")
     parser.add_argument("--random-lib", help="randomness shim (librandpin.so) to preload into everything in the environment")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="environment variable for the harness (repeat)")
     parser.add_argument("--clock", choices=["frozen", "advancing"], default="frozen", help="pinned clock mode (see clock.py)")
@@ -363,7 +402,8 @@ def main(argv: list[str] | None = None) -> int:
         upstream=args.upstream,
         env=dict(kv.partition("=")[::2] for kv in args.env),
         upstream_headers=headers, faketime_lib=args.faketime_lib, random_lib=args.random_lib,
-        ready=["sh", "-c", args.ready] if args.ready else None, ready_timeout=args.ready_timeout, clock_mode=args.clock, seed=args.seed, max_attempts=args.max_attempts,
+        ready=["sh", "-c", args.ready] if args.ready else None, ready_timeout=args.ready_timeout,
+        settle_timeout=args.settle_timeout if args.image and args.settle_timeout > 0 else None, clock_mode=args.clock, seed=args.seed, max_attempts=args.max_attempts,
         timeout=args.timeout, rerun_on_divergence=not args.no_rerun_on_divergence,
         fault_after_steps=args.fault_after_steps, fault=args.fault,
     )

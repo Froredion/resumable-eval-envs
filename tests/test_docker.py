@@ -273,3 +273,55 @@ def test_with_the_shim_a_database_uuid_replays(pg_image, shared_dir, upstream):
     rows = [e.response["result"]["content"][0]["text"] for e in Recording(shared_dir / "episode" / "mcp-fake.jsonl").events]
     uuids = [r.split()[-1] for r in rows]
     assert len(uuids) == 3 and len(set(uuids)) == 3  # distinct, and the first two replayed exactly
+
+
+# -- background jobs ----------------------------------------------------------
+
+def background_episode(image, shared_dir, settle_timeout):
+    """Step 0 starts a one-second job; the model takes two; step 1 reads its output.
+
+    In the original run the job is done before the read. A replay answers at
+    once, so without settling the read comes too early.
+    """
+    up = Upstream(script=[["bg"], ["read"]], delay=2)
+    env = DockerEnvironment(image, f"resumable-test-bg-{shared_dir.name}")
+    ep = Episode(
+        dir=shared_dir / "episode",
+        harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
+        environment=env,
+        mcp_servers={"fake": ["python", "/opt/eval/fake_mcp_server.py", "{workdir}/app_data"]},
+        upstream=up.url,
+        faketime_lib=FAKETIME,
+        settle_timeout=settle_timeout,
+        timeout=120,
+        fault_after_steps=3,  # after the last step: everything replays
+        fault="environment",
+        rerun_on_divergence=False,
+    )
+    return env, ep, up
+
+
+def test_without_settling_a_background_job_is_read_too_early(image, shared_dir):
+    env, ep, up = background_episode(image, shared_dir, settle_timeout=None)
+    try:
+        meta = ep.run()
+    finally:
+        env.stop()
+        up.httpd.shutdown()
+    assert meta["status"] == "diverged"
+    assert "missing" in meta["attempts"][1]["divergence"][0]["detail"]
+
+
+def test_settling_waits_for_a_background_job_as_the_original_run_did(image, shared_dir):
+    env, ep, up = background_episode(image, shared_dir, settle_timeout=30)
+    try:
+        meta = ep.run()
+        assert env.exec("cat", "bg.txt") == "done\n"
+    finally:
+        env.stop()
+        up.httpd.shutdown()
+    assert [a["outcome"] for a in meta["attempts"]] == ["failed", "completed"], meta
+    assert not any("settle_timeouts" in a for a in meta["attempts"])
+    events = Recording(shared_dir / "episode" / "model.jsonl").events
+    assert any("fake_harness.py" in p for p in events[1].meta["processes"])  # the list is the container's
+    assert not any("sleep 1" in p for p in events[1].meta["processes"])  # the job was done by step 1's reply

@@ -285,3 +285,19 @@ def test_answer_from_the_wrong_conversation_diverges(tmp_path, upstream):
     status, _, body = call(port, turn("A", other))
     assert status == 400 and "assistant turns differ" in json.loads(body)["error"]["message"]
     assert proxy.diverged
+
+
+def test_settle_timeout_is_noted_and_the_replay_carries_on(tmp_path, upstream):
+    rec = tmp_path / "model.jsonl"
+    proxy, port = start(rec, upstream)
+    proxy.processes = lambda: ["harness"]
+    first = call(port, msgs(1))
+    proxy.httpd.shutdown()
+    assert Recording(rec).events[0].meta["processes"] == ["harness"]
+
+    proxy, port = start(rec, upstream)
+    proxy.processes = lambda: ["harness", "server --port 8000"]  # never exits
+    proxy.settle_timeout = 0.3
+    assert call(port, msgs(1)) == first
+    assert proxy.settle_timeouts == [{"step": 0, "still_running": ["server --port 8000"]}]
+    proxy.httpd.shutdown()
