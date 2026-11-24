@@ -6,7 +6,9 @@ environment. The harness is pointed at the model proxy with
 ``ANTHROPIC_BASE_URL`` and at its MCP servers through a generated MCP config
 (``{mcp_config}`` in the harness command) that wraps every server in the MCP
 proxy, also inside the environment. Determinism controls (pinned clock,
-seeds) apply to every attempt, the original included.
+seeds, and pinned randomness with ``random_lib``) apply to every attempt,
+the original included. The seed is kept in ``episode.json``, so a resume
+cannot change it.
 
 An attempt ends one of three ways:
 
@@ -62,6 +64,11 @@ class Episode:
     upstream_headers: dict[str, str] = field(default_factory=dict)  # auth the proxy adds; never enters the environment
     env: dict[str, str] = field(default_factory=dict)
     faketime_lib: str | None = None
+    random_lib: str | None = None  # randomness shim (librandpin.so) to preload; see shim/randpin.c
+    # argv inside; the harness starts only once it exits 0, so the environment's own boot
+    # (Postgres) finishes under the start pin in every attempt instead of racing the first steps
+    ready: list[str] | None = None
+    ready_timeout: float = 120
     clock_mode: str = "frozen"  # or "advancing"; see clock.py
     seed: int = 0
     max_attempts: int = 4
@@ -75,8 +82,13 @@ class Episode:
         return self.dir / "episode.json"
 
     def run(self) -> dict[str, Any]:
+        if self.random_lib and self.environment.platform == "darwin":
+            raise ValueError("the randomness shim is an ELF preload library; it cannot run on macOS")
         self.dir.mkdir(parents=True, exist_ok=True)
         meta = self._load()
+        if meta.setdefault("seed", self.seed) != self.seed:
+            # A rebuild with another seed would draw other random values and diverge for no reason.
+            raise ValueError(f"episode was recorded with seed {meta['seed']}, not {self.seed}")
         for _ in range(self.max_attempts - len(meta["attempts"])):
             attempt = self._attempt(len(meta["attempts"]), meta["started"])
             meta["attempts"].append(attempt)
@@ -108,11 +120,20 @@ class Episode:
         clock = self.environment.clock
         clock.mode = self.clock_mode
         clock.pin(started)  # boot and harness start-up see the same time in every attempt
-        boot_env = clock.env(self.faketime_lib, self.environment.platform) | {
+        boot_env = clock.env([self.faketime_lib, self.random_lib], self.environment.platform) | {
             "PYTHONHASHSEED": str(self.seed),
             "RESUMABLE_EVALS_SEED": str(self.seed),
         }
+        if self.random_lib:
+            boot_env["RESUMABLE_EVALS_RANDOM_DIR"] = self.environment.random_dir
         rt = self.environment.start(self.dir, boot_env)
+        if self.ready and not self._wait_ready(rt, boot_env):
+            self.environment.stop()
+            return {"attempt": n, "started": time.time(), "resumed_from_step": recorded or None, "ended": time.time(),
+                    "exit_code": None, "model_steps": recorded, "outcome": "failed",
+                    "reason": f"environment not ready after {self.ready_timeout}s"}
+        if self.random_lib:
+            self._end_boot(rt)
         proxy = ModelProxy(recording, self.upstream, clock, self.upstream_headers)
         if self.state_probes:
             proxy.state_probe = lambda: self._probe(rt, boot_env)
@@ -152,6 +173,10 @@ class Episode:
 
         reports = self._divergence_reports()
         record |= {"ended": time.time(), "exit_code": proc.returncode, "model_steps": proxy.steps}
+        if self.random_lib:
+            fallbacks = self._random_fallbacks(rt)
+            if fallbacks:
+                record["random_fallbacks"] = fallbacks
         if reports:
             record |= {"outcome": "diverged", "reason": "rebuild diverged", "divergence": reports}
         elif reason is None and proc.returncode == 0:
@@ -183,6 +208,31 @@ class Episode:
                 result = {"exit": None, "sha256": None, "output": "probe timed out"}
             out[name] = result
         return out
+
+    def _wait_ready(self, rt: Runtime, env: dict[str, str]) -> bool:
+        cmd, host_env, cwd = rt.command(self.ready or [], env)
+        deadline = time.monotonic() + self.ready_timeout
+        while time.monotonic() < deadline:
+            p = subprocess.run(cmd, env=host_env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True)
+            if p.returncode == 0:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _end_boot(self, rt: Runtime) -> None:
+        """Tell the randomness shim the harness is starting: draws from here on
+        count apart from the boot's, whose number varies (see shim/randpin.c)."""
+        cmd, host_env, cwd = rt.command(["touch", f"{self.environment.random_dir}/harness-started"], {})
+        subprocess.run(cmd, env=host_env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, check=True)
+
+    def _random_fallbacks(self, rt: Runtime) -> list[str]:
+        """Processes the randomness shim could not pin (they drew real randomness).
+
+        Read from inside the environment, so lost with it if it died.
+        """
+        cmd, host_env, cwd = rt.command(["cat", f"{self.environment.random_dir}/errors"], {})
+        p = subprocess.run(cmd, env=host_env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        return p.stdout.splitlines() if p.returncode == 0 else []
 
     def _write_mcp_config(self, rt: Runtime) -> None:
         servers = {
@@ -268,6 +318,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--api-key-env", help="host env var holding an Anthropic API key the proxy adds upstream")
     parser.add_argument("--oauth-token-env", help="host env var holding a Claude OAuth token the proxy adds upstream")
     parser.add_argument("--faketime-lib", help="libfaketime library to preload into the harness and everything it starts")
+    parser.add_argument("--ready", metavar="COMMAND",
+                        help="command run inside the environment until it succeeds, before the harness starts")
+    parser.add_argument("--ready-timeout", type=float, default=120)
+    parser.add_argument("--random-lib", help="randomness shim (librandpin.so) to preload into everything in the environment")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="environment variable for the harness (repeat)")
     parser.add_argument("--clock", choices=["frozen", "advancing"], default="frozen", help="pinned clock mode (see clock.py)")
     parser.add_argument("--seed", type=int, default=0)
@@ -308,7 +362,8 @@ def main(argv: list[str] | None = None) -> int:
         dir=args.episode, harness=cmd, environment=environment, mcp_servers=servers, state_probes=probes,
         upstream=args.upstream,
         env=dict(kv.partition("=")[::2] for kv in args.env),
-        upstream_headers=headers, faketime_lib=args.faketime_lib, clock_mode=args.clock, seed=args.seed, max_attempts=args.max_attempts,
+        upstream_headers=headers, faketime_lib=args.faketime_lib, random_lib=args.random_lib,
+        ready=["sh", "-c", args.ready] if args.ready else None, ready_timeout=args.ready_timeout, clock_mode=args.clock, seed=args.seed, max_attempts=args.max_attempts,
         timeout=args.timeout, rerun_on_divergence=not args.no_rerun_on_divergence,
         fault_after_steps=args.fault_after_steps, fault=args.fault,
     )

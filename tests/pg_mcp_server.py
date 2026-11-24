@@ -3,7 +3,8 @@
 ``incr`` inserts a row and returns its id and created_at (DEFAULT now()),
 so a rebuilt environment's database must replay ids and timestamps exactly.
 With PG_HIDDEN_RANDOM=1 it also writes random() to a side table without
-saying so: a side effect no tool result shows.
+saying so: a side effect no tool result shows. With PG_UUID=1 the result
+also carries a gen_random_uuid(), which only replays with the randomness shim.
 Uses psql over TCP (the image's init-time server is socket-only, so a TCP
 connection means the real server is up).
 """
@@ -45,6 +46,8 @@ for line in sys.stdin:
         row = sql("SET TIME ZONE 'UTC'; INSERT INTO events DEFAULT VALUES RETURNING id || ' ' || created_at")
         if HIDDEN:
             sql("INSERT INTO side DEFAULT VALUES")
+        if os.environ.get("PG_UUID") == "1":
+            row += " " + sql("SELECT gen_random_uuid()")
         result = {"content": [{"type": "text", "text": row}]}
     else:
         result = {}

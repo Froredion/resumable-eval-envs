@@ -152,3 +152,17 @@ def test_auth_failure_stops_the_episode(tmp_path, base, upstream):
     upstream.status = 401
     meta = episode(tmp_path, base, upstream).run()
     assert meta["status"] == "auth_failed" and len(meta["attempts"]) == 1
+
+
+def test_resume_with_another_seed_is_refused(tmp_path, base, upstream):
+    episode(tmp_path, base, upstream, env=crash_once(tmp_path, 1), max_attempts=1).run()
+    assert json.loads((tmp_path / "episode" / "episode.json").read_text())["seed"] == 0
+    with pytest.raises(ValueError, match="recorded with seed 0"):
+        episode(tmp_path, base, upstream, seed=1).run()
+
+
+def test_random_shim_refused_on_macos(tmp_path, base, upstream):
+    ep = episode(tmp_path, base, upstream, random_lib="/usr/local/lib/librandpin.so")
+    ep.environment.platform = "darwin"
+    with pytest.raises(ValueError, match="cannot run on macOS"):
+        ep.run()

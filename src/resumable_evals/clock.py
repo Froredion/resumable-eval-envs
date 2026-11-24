@@ -41,7 +41,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 
 class Clock:
@@ -62,11 +62,13 @@ class Clock:
         tmp.write_text(text)
         os.replace(tmp, self.path)  # readers never see a half-written file
 
-    def env(self, lib: str | None = None, platform: str = sys.platform) -> dict[str, str]:
+    def env(self, lib: str | Sequence[str | None] | None = None, platform: str = sys.platform) -> dict[str, str]:
         """Environment variables that put a process on this clock.
 
-        ``platform`` is the OS the process runs on, which decides how ``lib``
-        is preloaded.
+        ``lib`` is the libfaketime library to preload, or several libraries
+        (libfaketime and others, such as the randomness shim); ``None``
+        entries are skipped. ``platform`` is the OS the process runs on,
+        which decides how they are preloaded.
         """
         env = {
             "FAKETIME_TIMESTAMP_FILE": str(self.path),
@@ -78,9 +80,10 @@ class Clock:
             # create libfaketime's per-PID semaphore and exits.
             "FAKETIME_DISABLE_SHM": "1",
         }
-        if lib:
+        libs = [l for l in ([lib] if isinstance(lib, str) else lib or []) if l]
+        if libs:
             if platform == "darwin":
-                env |= {"DYLD_INSERT_LIBRARIES": lib, "DYLD_FORCE_FLAT_NAMESPACE": "1"}
+                env |= {"DYLD_INSERT_LIBRARIES": ":".join(libs), "DYLD_FORCE_FLAT_NAMESPACE": "1"}
             else:
-                env["LD_PRELOAD"] = lib
+                env["LD_PRELOAD"] = ":".join(libs)
         return env

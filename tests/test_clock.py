@@ -24,3 +24,9 @@ def test_env_points_libfaketime_at_the_file(tmp_path):
     assert "/usr/lib/faketime/libfaketime.so.1" in (env.get("LD_PRELOAD"), env.get("DYLD_INSERT_LIBRARIES"))
     assert Clock(tmp_path / "clock").env("/lib.so", platform="linux")["LD_PRELOAD"] == "/lib.so"
     assert "LD_PRELOAD" not in Clock(tmp_path / "clock").env() and "DYLD_INSERT_LIBRARIES" not in Clock(tmp_path / "clock").env()
+
+
+def test_env_preloads_several_libraries(tmp_path):
+    c = Clock(tmp_path / "clock")
+    assert c.env(["/faketime.so", None, "/randpin.so"], platform="linux")["LD_PRELOAD"] == "/faketime.so:/randpin.so"
+    assert c.env([None], platform="linux").get("LD_PRELOAD") is None

@@ -34,6 +34,7 @@ from .clock import Clock
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent  # directory containing resumable_evals/
 CONTAINER_CLOCK = "/run/resumable-evals/clock"
+CONTAINER_RANDOM = "/run/resumable-evals/random"
 
 Command = tuple[list[str], dict[str, str], str | None]  # argv, host process env, host cwd
 
@@ -52,6 +53,7 @@ class Environment(Protocol):
     proxy_bind: str  # address the model proxy listens on so the environment can reach it
     platform: str  # OS inside: "linux", "darwin"
     clock: Clock  # the environment's pinned clock; pins before start take effect at boot
+    random_dir: str  # where the randomness shim keeps its counters, as seen inside; empty at every start
 
     def start(self, episode_dir: Path, boot_env: dict[str, str]) -> Runtime:
         """Tear down any previous instance and bring up a fresh one from the base.
@@ -85,14 +87,18 @@ class DirEnvironment:
     proxy_bind: str = "127.0.0.1"
     platform: str = sys.platform
     clock: Clock = field(init=False)
+    random_dir: str = field(init=False)
 
     def __post_init__(self) -> None:
         self.clock = Clock(self.workdir.with_name(self.workdir.name + ".clock"))
+        self.random_dir = str(self.workdir.with_name(self.workdir.name + ".random"))
 
     def start(self, episode_dir: Path, boot_env: dict[str, str]) -> Runtime:
-        if self.workdir.exists():
-            shutil.rmtree(self.workdir)
+        for d in (self.workdir, Path(self.random_dir)):
+            if d.exists():
+                shutil.rmtree(d)
         shutil.copytree(self.base, self.workdir, symlinks=True)
+        Path(self.random_dir).mkdir(mode=0o777)
         workdir = str(self.workdir)
         return Runtime(
             workdir=workdir,
@@ -144,6 +150,7 @@ class DockerEnvironment:
     python: str = "python"
     platform: str = "linux"
     clock: Clock = field(init=False)
+    random_dir: str = CONTAINER_RANDOM
 
     def __post_init__(self) -> None:
         check_mounts(self.run_args)
@@ -160,15 +167,20 @@ class DockerEnvironment:
                 "-v", f"{PACKAGE_ROOT}:/opt/resumable-evals:ro",
                 *(x for key, path in self.volumes.items() for x in ("-v", f"{self._volume(key)}:{path}")),
                 *env_flags, *self.run_args, self.image)
-        if self._staged_clock is not None:
-            # In place before the image's command starts its services.
-            staging = Path(tempfile.mkdtemp())
-            try:
-                (staging / "resumable-evals").mkdir()
-                (staging / "resumable-evals" / "clock").write_text(self._staged_clock)
-                _docker("cp", str(staging / "resumable-evals"), f"{self.name}:{os.path.dirname(os.path.dirname(CONTAINER_CLOCK))}/")
-            finally:
-                shutil.rmtree(staging)
+        # In place before the image's command starts its services: the clock,
+        # and the randomness shim's counter directory, writable by every user
+        # (Postgres runs as its own).
+        staging = Path(tempfile.mkdtemp())
+        try:
+            run_dir = staging / "resumable-evals"
+            run_dir.mkdir()
+            if self._staged_clock is not None:
+                (run_dir / "clock").write_text(self._staged_clock)
+            (run_dir / os.path.basename(CONTAINER_RANDOM)).mkdir()
+            os.chmod(run_dir / os.path.basename(CONTAINER_RANDOM), 0o777)
+            _docker("cp", str(run_dir), f"{self.name}:{os.path.dirname(os.path.dirname(CONTAINER_CLOCK))}/")
+        finally:
+            shutil.rmtree(staging)
         _docker("start", self.name)
         self._running = True
         deadline = time.monotonic() + 30
