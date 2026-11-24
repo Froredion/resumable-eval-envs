@@ -120,11 +120,37 @@ Start with record and rebuild for one harness; snapshots come last and only if l
 4. **Widen coverage:** remaining harnesses, model providers and environments; track divergence rate per environment to find remaining non-determinism.
 5. **Optional snapshots:** copy-on-write volume snapshots every N steps, only for environments where episodes are long enough that re-execution is too slow.
 
+## What the build learned
+
+Rollout steps 1–3 are built (status and usage in the README). Building them refined the design in these places:
+
+- **The harness's own tools are checked in the next model request.** Claude Code runs Bash, Write and Edit itself, so they never pass through the MCP proxy. Their results reach the model in the next request, and the model proxy compares every tool result after the model's last turn with the recording. No shell wrapper or exec hook is needed to check them.
+- **Replies are matched by order and checked by content.** A replayed request must have the recorded shape (model, stream flag, message count). Its assistant turns must also match exactly: they are the harness's rendering of recorded replies, so a request answered from the wrong recorded event diverges. Some requests arrive while another is still in flight (parallel subagents). These are recorded as overlapping, and on rebuild each is answered from the event it matches, in whatever order they arrive.
+- **Clock:** libfaketime, frozen at each step's pinned time by default. Wall-clock time reads exactly the step's time, and monotonic clocks are untouched, so sleeps and timeouts still work. The container boots with the clock already pinned, so its own services (Postgres) run on it. The clock file lives inside the container and is written with `docker exec`: through Docker Desktop's bind mounts, an updated file reads as missing or stale. Claude Code needs libfaketime 0.9.11 or later.
+- **Randomness:** a preload shim (`librandpin.so`) replaces libc's random sources and shared OpenSSL's `RAND_bytes` with a stream per process. The stream is keyed by the seed, the step's pinned time and a per-step counter.
+  - **Pinned:** Python (`uuid4`, `random`, `tempfile`), `/dev/urandom` readers, glibc's `arc4random`, and Postgres `gen_random_uuid()` and `random()`.
+  - **Not pinned:**
+    - A statically linked OpenSSL. Node's `crypto` mixes the pid, thread id and time into its nonce.
+    - Tools that derive names from the monotonic clock, such as Debian bookworm's `mktemp`.
+
+    These show up as divergences.
+  - **Boot is kept apart.** Draws made while the environment boots are counted separately from the harness's. `--ready` holds the harness until the environment's services are up. Together these stop a boot of varying length from shifting the harness's random values.
+- **Background jobs:** the container's processes are recorded as each model reply comes back. On rebuild, the reply is held until every job that had exited by that point in the original run has exited again. This means the agent reads a job's output at the same stage in both runs.
+- **State probes** cover side effects no tool result shows, such as a database row written with a different value. A probe is a command run every step whose output hash must replay.
+- **The proxy adds the credential**, so it never enters the container. Auth failures (401, 403) and transient ones (408, 429, 5xx) are not recorded.
+- **Nothing carries state between attempts:**
+  - Containers are removed with their anonymous volumes.
+  - Named volumes are recreated empty.
+  - Writable host mounts are refused.
+
 ## Open questions
 
 - [ ] What schedules containers across hosts at scale (plain Docker hosts, Swarm, Nomad, Kubernetes)?
 - [ ] Which harnesses and model providers need support first?
-- [ ] Which tools or MCP servers read the clock or generate random values that need pinning?
-- [ ] Do harnesses run commands directly in containers, or only through MCP?
+- [x] Which tools or MCP servers read the clock or generate random values that need pinning? *Partly answered:*
+  - Anything that reads the clock, `getrandom`, `/dev/urandom` or a shared OpenSSL is now pinned.
+  - Node's `crypto` and monotonic-clock temp names are not.
+  - Per-environment divergence rates will show what else matters.
+- [x] Do harnesses run commands directly in containers, or only through MCP? *Yes:* Claude Code runs Bash, Write and Edit itself. Their results are checked in the next model request.
 - [ ] Typical episode length and step count, to set checkpoint frequency?
 - [ ] Should resumed episodes count in headline results, or be reported separately?
