@@ -18,8 +18,23 @@ reordered side calls and a harness that has already gone a different way.
 The tool results in the request's last message must also match the recorded
 ones (after normalization). This is the per-step check for tools the harness
 runs itself, such as Claude Code's Bash and Write, which never pass through
-the MCP proxy. On any mismatch the harness gets a non-retryable 400, details
-go to ``<recording>.diverged.json`` and the proxy stops with status 3.
+the MCP proxy. So must the request's assistant turns: they are the harness's
+rendering of recorded replies, identical on a correct replay, so a request
+answered from the wrong recorded event (a reordered side call, or another
+subagent's conversation) is caught even when its shape matches. On any
+mismatch the harness gets a non-retryable 400, details go to
+``<recording>.diverged.json`` and the proxy stops with status 3.
+
+Requests that arrive while another is in flight (parallel subagents) are
+answered one at a time, as always, and recorded with ``overlaps_previous``.
+On rebuild such a group may arrive in another order, so a request is
+answered from the event in its group that it matches (shape, assistant
+turns and tool results; among several that fit, the one with the same
+messages); outside a group the order is strict. A request
+that matches a later event (one subagent running ahead of another) waits,
+up to ``overlap_wait`` seconds, for the events before it to be answered. A
+state probe is not run for an overlapping request: other subagents may be
+mid-step.
 
 With a ``state_probe``, the environment's state is also checked at every
 step: the probe runs before each model request is answered (so it sees the
@@ -107,6 +122,24 @@ def tool_results(body: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def assistant_turns(body: dict[str, Any]) -> list[Any]:
+    """The conversation's earlier model turns, as the harness sends them back."""
+    return [m.get("content") for m in body.get("messages") or [] if isinstance(m, dict) and m.get("role") == "assistant"]
+
+
+def mismatch(recorded: dict[str, Any], body: dict[str, Any]) -> str | None:
+    """Why ``body`` cannot be answered from the recorded request, or None if it can."""
+    if recorded["shape"] != shape(body):
+        return f"request shape differs: recorded {recorded['shape']}, got {shape(body)}"
+    m = compare(assistant_turns(recorded["body"]), assistant_turns(body))
+    if m:
+        return f"assistant turns differ: {m}"
+    m = compare(tool_results(recorded["body"]), tool_results(body))
+    if m:
+        return f"tool results differ: {m}"
+    return None
+
+
 def state_differences(recorded: dict[str, Any], state: dict[str, Any]) -> list[str]:
     """Names of state probes whose result differs from the recording."""
     names = sorted(set(recorded) | set(state))
@@ -144,7 +177,9 @@ class ModelProxy:
         self._https = u.scheme == "https"
         self._netloc = u.netloc
         self._base = u.path.rstrip("/")
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()
+        self.overlap_wait = 60.0  # see the module docstring
+        self._last_sent = float("-inf")  # monotonic time the last model reply was handed back
         self._steps = len(recording.of_kind("model"))
         self.diverged: Diverged | None = None
         self.auth_failed: int | None = None  # status of the last upstream auth failure on a model call
@@ -190,46 +225,69 @@ class ModelProxy:
             body = json.loads(raw)
         except ValueError:
             return self.forward("POST", path, headers, raw)
+        arrived = time.monotonic()
+        deadline = arrived + self.overlap_wait
         with self._lock:
-            if self.diverged:
-                return _error(400, f"resumable-evals: rebuild {self.diverged}", "invalid_request_error")
-            event = self.cursor.peek_model()
-            if event is not None:
-                if event.request["shape"] != shape(body):
-                    return self._diverge(event, f"request shape differs: recorded {event.request['shape']}, got {shape(body)}")
-                mismatch = compare(tool_results(event.request["body"]), tool_results(body))
-                if mismatch:
-                    return self._diverge(event, f"tool results differ: {mismatch}")
-                if self.state_probe and "state" in event.meta:
-                    state = self.state_probe()
-                    differing = state_differences(event.meta["state"], state)
-                    if differing:
-                        return self._diverge(event, f"environment state differs: {', '.join(differing)}",
-                                             {"recorded_state": event.meta["state"], "state": state})
-                reply = self.cursor.next_model_reply()
-                if self.clock and "t" in event.meta:
-                    self.clock.pin(event.meta["t"])
-                return reply["status"], [("Content-Type", reply["content_type"])], reply["body"].encode()
-            state = self.state_probe() if self.state_probe else None
-            status, out, data = self.forward("POST", path, headers, raw)
-            self.auth_failed = status if status in (401, 403) else None
-            if not unrecorded(status):
-                t = time.time()
-                content_type = next((v for k, v in out if k.lower() == "content-type"), "application/json")
-                self.recording.append(
-                    self._steps,
-                    "model",
-                    {"path": path, "shape": shape(body), "body": body},
-                    {"status": status, "content_type": content_type, "body": data.decode()},
-                    t=t,
-                    **({"state": state} if state is not None else {}),
-                )
-                self._steps += 1
-                if self.clock:
-                    self.clock.pin(t)
-                if self.on_record:
-                    self.on_record(self._steps)
-            return status, out, data
+            while (response := self._messages(path, headers, raw, body, arrived, time.monotonic() < deadline)) is None:
+                self._lock.wait(max(0.0, deadline - time.monotonic()))
+            self._last_sent = time.monotonic()
+            self._lock.notify_all()
+            return response
+
+    def _messages(self, path: str, headers: Any, raw: bytes, body: dict[str, Any], arrived: float,
+                  may_wait: bool) -> Response | None:
+        """Answer a model request; None means wait for an earlier one first."""
+        if self.diverged:
+            return _error(400, f"resumable-evals: rebuild {self.diverged}", "invalid_request_error")
+        # Sent before the previous reply was back: another conversation's request (subagents).
+        overlaps = arrived < self._last_sent
+        window = self.cursor.model_window()
+        if window:
+            checked = [(e, mismatch(e.request, body)) for e in window]
+            fits = [e for e, why in checked if why is None]
+            # Several fit (subagents' first requests have no turns to tell them apart):
+            # prefer the one whose messages are the same, which a subagent's prompt usually is.
+            event = next((e for e in fits if compare(e.request["body"].get("messages"), body.get("messages")) is None),
+                         fits[0] if fits else None)
+            if event is None:
+                later = [e for e in self.cursor.unanswered_models() if e not in window]
+                if may_wait and any(mismatch(e.request, body) is None for e in later):
+                    return None  # running ahead of another conversation; its request will come
+                first, why = checked[0]
+                if len(checked) > 1:
+                    why = f"matches none of {len(checked)} overlapping recorded requests; the first: {why}"
+                return self._diverge(first, why)
+            if self.state_probe and "state" in event.meta:
+                state = self.state_probe()
+                differing = state_differences(event.meta["state"], state)
+                if differing:
+                    return self._diverge(event, f"environment state differs: {', '.join(differing)}",
+                                         {"recorded_state": event.meta["state"], "state": state})
+            reply = self.cursor.take_model(event)
+            if self.clock and "t" in event.meta:
+                self.clock.pin(event.meta["t"])
+            return reply["status"], [("Content-Type", reply["content_type"])], reply["body"].encode()
+        state = self.state_probe() if self.state_probe and not overlaps else None
+        status, out, data = self.forward("POST", path, headers, raw)
+        self.auth_failed = status if status in (401, 403) else None
+        if not unrecorded(status):
+            t = time.time()
+            content_type = next((v for k, v in out if k.lower() == "content-type"), "application/json")
+            self.recording.append(
+                self._steps,
+                "model",
+                {"path": path, "shape": shape(body), "body": body},
+                {"status": status, "content_type": content_type, "body": data.decode()},
+                t=t,
+                **({"state": state} if state is not None else {}),
+                **({"overlaps_previous": True} if overlaps else {}),
+            )
+            self._steps += 1
+            if self.clock:
+                self.clock.pin(t)
+            if self.on_record:
+                self.on_record(self._steps)
+        return status, out, data
 
     def _diverge(self, event: Any, detail: str, extra: dict[str, Any] | None = None) -> Response:
         d = Diverged(event, detail)

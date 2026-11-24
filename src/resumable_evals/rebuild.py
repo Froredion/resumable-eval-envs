@@ -1,7 +1,10 @@
 """Rebuild cursor: walks a recording while the harness replays.
 
 Model requests are answered from the recording by order, not by content
-(harnesses may put timestamps or ids in prompts). Tool calls are re-executed
+(harnesses may put timestamps or ids in prompts). Requests the original run
+sent concurrently (subagents) were recorded as overlapping; on rebuild they
+may arrive in another order, so within such a group the caller picks the
+event a request matches (:meth:`RebuildCursor.model_window`). Tool calls are re-executed
 by the caller against the fresh environment; ``check_tool`` compares the
 result with the recording. Once the recording is exhausted the cursor is
 live and the proxies forward calls normally.
@@ -9,7 +12,7 @@ live and the proxies forward calls normally.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .compare import Mismatch, compare
@@ -26,8 +29,9 @@ class Diverged(Exception):
 @dataclass
 class RebuildCursor:
     recording: Recording
-    _model_i: int = 0
+    _model_i: int = 0  # first model event not yet answered
     _tool_i: int = 0
+    _taken: set[int] = field(default_factory=set)  # model events answered out of order, past _model_i
 
     def __post_init__(self) -> None:
         self._models = self.recording.of_kind("model")
@@ -47,10 +51,38 @@ class RebuildCursor:
 
     def next_model_reply(self) -> Any | None:
         """Recorded reply for the next model request, or None once live."""
-        if self._model_i >= len(self._models):
+        event = self.peek_model()
+        if event is None:
             return None
-        event = self._models[self._model_i]
-        self._model_i += 1
+        return self.take_model(event)
+
+    def model_window(self) -> list[Event]:
+        """Recorded events the next model request may be answered from.
+
+        The first unanswered event, plus the events after it that the
+        original run received while an earlier request was still in flight
+        (``overlaps_previous``): those may arrive in any order on rebuild.
+        Empty once live.
+        """
+        out = []
+        for i in range(self._model_i, len(self._models)):
+            if i > self._model_i and not self._models[i].meta.get("overlaps_previous"):
+                break
+            if i not in self._taken:
+                out.append(self._models[i])
+        return out
+
+    def unanswered_models(self) -> list[Event]:
+        """Every recorded model event not yet answered, in order."""
+        return [e for i, e in enumerate(self._models) if i >= self._model_i and i not in self._taken]
+
+    def take_model(self, event: Event) -> Any:
+        """Mark a model event from :meth:`model_window` answered; return its reply."""
+        i = self._models.index(event)
+        self._taken.add(i)
+        while self._model_i in self._taken:
+            self._taken.discard(self._model_i)
+            self._model_i += 1
         return event.response
 
     def next_tool_call(self) -> Event | None:

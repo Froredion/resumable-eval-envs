@@ -1,6 +1,7 @@
 import http.client
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -18,6 +19,7 @@ class FakeUpstream:
     def __init__(self):
         self.hits = []
         self.fail_next = []
+        self.delay = 0.0
         up = self
 
         class H(BaseHTTPRequestHandler):
@@ -26,6 +28,7 @@ class FakeUpstream:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 up.hits.append((self.path, dict(self.headers)))
+                time.sleep(up.delay)
                 if up.fail_next:
                     return self._send(up.fail_next.pop(0), "application/json", b'{"type":"error"}')
                 n = len(up.hits)
@@ -209,3 +212,76 @@ def test_tool_results_followed_by_a_harness_message_are_checked(tmp_path, upstre
     proxy, port = start(rec, upstream)
     status, _, body = call(port, tool_turn(3, "beta") + [nudge])
     assert status == 400 and "tool results differ" in json.loads(body)["error"]["message"]
+
+
+# -- parallel conversations (subagents) -------------------------------------
+
+def turn(task, *replies):
+    """A conversation: the task, then each earlier reply and a user follow-up."""
+    m = [{"role": "user", "content": f"task {task}"}]
+    for r in replies:
+        m += [{"role": "assistant", "content": json.loads(r)["content"]}, {"role": "user", "content": "go on"}]
+    return m
+
+
+def in_parallel(*calls):
+    out = [None] * len(calls)
+    threads = [threading.Thread(target=lambda i=i, c=c: out.__setitem__(i, c())) for i, c in enumerate(calls)]
+    for t in threads:
+        t.start()
+        time.sleep(0.05)  # start in this order
+    for t in threads:
+        t.join()
+    return out
+
+
+def test_parallel_conversations_replay_in_another_order(tmp_path, upstream):
+    rec = tmp_path / "model.jsonl"
+    upstream.delay = 0.3  # B arrives while A is in flight
+    proxy, port = start(rec, upstream)
+    a1, b1 = in_parallel(lambda: call(port, turn("A")), lambda: call(port, turn("B")))
+    a2, b2 = in_parallel(lambda: call(port, turn("A", a1[2])), lambda: call(port, turn("B", b1[2])))
+    proxy.httpd.shutdown()
+    events = Recording(rec).events
+    assert [e.meta.get("overlaps_previous", False) for e in events] == [False, True, False, True]
+
+    # Rebuild: the same conversations, each round arriving in the opposite order.
+    proxy, port = start(rec, upstream)
+    rb1, ra1 = in_parallel(lambda: call(port, turn("B")), lambda: call(port, turn("A")))
+    rb2, ra2 = in_parallel(lambda: call(port, turn("B", rb1[2])), lambda: call(port, turn("A", ra1[2])))
+    assert (ra1, rb1, ra2, rb2) == (a1, b1, a2, b2)  # each conversation got its own replies
+    assert not proxy.diverged and len(upstream.hits) == 4
+    proxy.httpd.shutdown()
+
+
+def test_a_conversation_running_ahead_waits_for_the_other(tmp_path, upstream):
+    rec = tmp_path / "model.jsonl"
+    upstream.delay = 0.3
+    proxy, port = start(rec, upstream)
+    a1, b1 = in_parallel(lambda: call(port, turn("A")), lambda: call(port, turn("B")))
+    upstream.delay = 0
+    b2 = call(port, turn("B", b1[2]))  # sent after both replies: strictly ordered after them
+    proxy.httpd.shutdown()
+
+    proxy, port = start(rec, upstream)
+    assert call(port, turn("B")) == b1
+    # B's next request arrives before A's first; it waits for A instead of diverging.
+    rb2, ra1 = in_parallel(lambda: call(port, turn("B", b1[2])), lambda: (time.sleep(0.3), call(port, turn("A")))[1])
+    assert (ra1, rb2) == (a1, b2) and not proxy.diverged
+    proxy.httpd.shutdown()
+
+
+def test_answer_from_the_wrong_conversation_diverges(tmp_path, upstream):
+    """Same shape, no overlap: the assistant turns show the request belongs elsewhere."""
+    rec = tmp_path / "model.jsonl"
+    proxy, port = start(rec, upstream)
+    r1 = call(port, turn("A"))
+    call(port, turn("A", r1[2]))
+    proxy.httpd.shutdown()
+
+    proxy, port = start(rec, upstream)
+    call(port, turn("A"))
+    other = json.dumps({"content": [{"text": "a reply from another conversation"}]}).encode()
+    status, _, body = call(port, turn("A", other))
+    assert status == 400 and "assistant turns differ" in json.loads(body)["error"]["message"]
+    assert proxy.diverged
