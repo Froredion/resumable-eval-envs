@@ -4,6 +4,22 @@
 
 Resume an eval episode that failed partway through, from its last completed step, without changing the harness or the agent.
 
+## Why this exists
+
+AI data companies and research labs run agents through long, multi-step tasks in containerized environments, at scale. Many of those runs never finish cleanly. A container gets killed, a host goes down, a harness hangs or a network call times out, often hours into a task. By my estimate, around half the runs of many tasks at these companies end failed or botched.
+
+Today the usual fix is to throw the run away and start the task over from step zero. That pays twice for everything that already worked:
+
+- **Model calls:** every completed step is generated again, at full token cost.
+- **Compute and wall-clock time:** the environment is rebuilt and every step is redone, including the slow ones.
+- **The run itself:** a restart is a new trajectory, not the one that crashed, so the work already done is lost, not just delayed.
+
+Simply restarting a container doesn't fix this. The agent's context lives in the harness, and processes, open connections and in-memory state don't survive a crash. A restored disk alone isn't the moment the run failed (see [the design doc](docs/DESIGN.md#problem)).
+
+resumable-evals resumes the run instead. Every model call and tool call is recorded as it happens. After a failure, a fresh environment is rebuilt by replaying the recording. Model replies come from the recording, so replay makes no model calls and isn't charged against the episode's time limit. Tool calls are re-executed and every result is checked against the original. At most the one step in progress is lost. Resumed episodes are tagged, so they can be reported apart from uninterrupted ones. It works with unmodified harnesses and agents: they just talk to the proxies instead of the model API and MCP servers directly.
+
+## How it works
+
 Environments are offline and their tools deterministic, so nothing is snapshotted. Two proxies record every model call and tool call. After a failure, a fresh container re-executes the recorded tool calls in order and checks each result against the recording. The unmodified harness fast-forwards on recorded model replies, and at the failed step both proxies go live. Design: [docs/DESIGN.md](docs/DESIGN.md).
 
 Status: alpha. Claude Code on the Anthropic Messages API, with stdio MCP servers, in single-container Docker environments.
