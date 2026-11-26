@@ -156,4 +156,5 @@ Rollout steps 1–3 are built (status and usage in the README). Building them re
   - Per-environment divergence rates will show what else matters.
 - [x] Do harnesses run commands directly in containers, or only through MCP? *Yes:* Claude Code runs Bash, Write and Edit itself. Their results are checked in the next model request.
 - [ ] Typical episode length and step count, to set checkpoint frequency?
+- [ ] Do stateful MCP servers keep everything that matters in `app_data/`? Snapshots save volumes, not RAM, so restoring one restarts each server from disk and replays only the later calls. Any state held only in memory is lost (caught as a divergence). Either require servers to persist to `app_data/`, or snapshot process memory too (CRIU-style).
 - [ ] Should resumed episodes count in headline results, or be reported separately?
