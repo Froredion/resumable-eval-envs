@@ -74,8 +74,9 @@ def base(tmp_path):
 
 
 def episode(tmp_path, base, upstream, **kw):
+    kw.setdefault("attempt_timeout", 30)
     return Episode(dir=tmp_path / "episode", harness=HARNESS, environment=DirEnvironment(base, tmp_path / "work"),
-                   mcp_servers=MCP, upstream=upstream.url, timeout=30, **kw)
+                   mcp_servers=MCP, upstream=upstream.url, **kw)
 
 
 def crash_once(tmp_path, at_step):
@@ -147,12 +148,54 @@ def test_divergence_can_end_the_episode(tmp_path, base, upstream):
     assert meta["status"] == "diverged" and len(meta["attempts"]) == 2
 
 
-def test_timeout_counts_as_failure(tmp_path, base, upstream):
+def test_attempt_timeout_counts_as_failure(tmp_path, base, upstream):
+    """A hang: the attempt is retried."""
     ep = episode(tmp_path, base, upstream, max_attempts=2)
-    ep.harness, ep.timeout = [sys.executable, "-c", "import time; time.sleep(30)"], 0.5
+    ep.harness, ep.attempt_timeout = [sys.executable, "-c", "import time; time.sleep(30)"], 0.5
     meta = ep.run()
     assert meta["status"] == "failed"
-    assert [a["reason"] for a in meta["attempts"]] == ["timeout after 0.5s"] * 2
+    assert [a["reason"] for a in meta["attempts"]] == ["attempt timeout after 0.5s"] * 2
+
+
+def test_using_up_the_time_limit_ends_the_episode(tmp_path, base, upstream):
+    ep = episode(tmp_path, base, upstream, max_attempts=3)
+    ep.harness, ep.timeout = [sys.executable, "-c", "import time; time.sleep(30)"], 0.5
+    meta = ep.run()
+    assert meta["status"] == "timed_out" and len(meta["attempts"]) == 1  # not retried
+
+
+def test_a_resumed_episode_gets_no_extra_time(tmp_path, base):
+    """Four steps of 0.4 s against a 1.4 s limit: an uninterrupted run times out, and so does a
+    resumed one, which before had the whole limit again for its last two steps."""
+    slow = Upstream(delay=0.4)
+    try:
+        straight = episode(tmp_path / "a", base, slow, timeout=1.4).run()
+        resumed = episode(tmp_path / "b", base, slow, timeout=1.4, env=crash_once(tmp_path, at_step=1)).run()
+    finally:
+        slow.httpd.shutdown()
+    assert straight["status"] == "timed_out"
+    assert [a["outcome"] for a in resumed["attempts"]] == ["failed", "timed_out"], resumed
+    events = Recording(tmp_path / "b" / "episode" / "model.jsonl").events
+    lives = [e.meta["live"] for e in events]
+    assert lives == sorted(lives)  # the second attempt carried on from the first one's time
+
+
+def test_episode_json_is_saved_before_the_first_attempt(tmp_path, base, upstream):
+    class Broken(DirEnvironment):
+        def start(self, boot_env):
+            raise RuntimeError("orchestrator host lost")
+    ep = episode(tmp_path, base, upstream)
+    ep.environment = Broken(base, tmp_path / "work")
+    with pytest.raises(RuntimeError):
+        ep.run()
+    meta = json.loads((tmp_path / "episode" / "episode.json").read_text())
+    assert meta["seed"] == 0 and meta["started"] and meta["attempts"] == []
+
+
+def test_a_recording_without_live_time_is_not_resumed_under_a_time_limit(tmp_path, base, upstream):
+    Recording(tmp_path / "episode" / "model.jsonl").append(0, "model", {"shape": {}, "body": {}}, {}, t=1.0)
+    with pytest.raises(ValueError, match="no live working time"):
+        episode(tmp_path, base, upstream, timeout=30).run()
 
 
 def test_auth_failure_stops_the_episode(tmp_path, base, upstream):

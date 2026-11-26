@@ -13,15 +13,19 @@ seeds, and pinned randomness with ``random_lib``) apply to every attempt,
 the original included. The seed is kept in ``episode.json``, so a resume
 cannot change it.
 
-An attempt ends one of three ways:
+An attempt ends in one of these ways:
 
 - **completed**: the harness exited 0. Done.
 - **failed**: the harness or the environment crashed, the harness exited
-  non-zero, or the attempt timed out. The next
+  non-zero, or the attempt ran past ``attempt_timeout`` (a hang). The next
   attempt rebuilds: same recordings, fresh environment; the proxies replay
   and check up to where the failure happened, then go live.
 - **auth_failed**: the model API rejected the credential. The episode stops;
   rebuilding cannot fix that.
+- **timed_out**: the episode used up ``timeout``, its live working time
+  (see ``model_proxy``: replay is not charged, and a resumed attempt carries
+  on from the time the episode had already used). The episode ends there,
+  as an uninterrupted one would.
 - **diverged**: a proxy found a re-executed result that does not match the
   recording. The harness is stopped. With ``rerun_on_divergence`` the
   recordings are moved to ``diverged-<attempt>/`` and the episode reruns
@@ -100,7 +104,8 @@ class Episode:
     clock_mode: str = "frozen"  # or "advancing"; see clock.py
     seed: int = 0
     max_attempts: int = 4
-    timeout: float | None = None
+    timeout: float | None = None  # the episode's live working time, across attempts; see the module docstring
+    attempt_timeout: float | None = None  # wall time per attempt, replay included: a hang; the attempt is retried
     rerun_on_divergence: bool = True
     fault_after_steps: int | None = None  # testing only: fail the first attempt once this many model steps are recorded
     fault: str = "harness"  # what fails: "harness" (killed) or "environment" (container killed)
@@ -119,13 +124,14 @@ class Episode:
         if meta.setdefault("seed", self.seed) != self.seed:
             # A rebuild with another seed would draw other random values and diverge for no reason.
             raise ValueError(f"episode was recorded with seed {meta['seed']}, not {self.seed}")
+        self._save(meta)  # seed and start time are settled before anything is recorded
         for _ in range(self.max_attempts - len(meta["attempts"])):
             attempt = self._attempt(len(meta["attempts"]), meta["started"])
             meta["attempts"].append(attempt)
             if attempt["outcome"] == "completed":
                 meta["status"] = "completed"
-            elif attempt["outcome"] == "auth_failed":
-                meta["status"] = "auth_failed"
+            elif attempt["outcome"] in ("auth_failed", "timed_out"):
+                meta["status"] = attempt["outcome"]
             elif attempt["outcome"] == "diverged":
                 if self.rerun_on_divergence:
                     self._archive(attempt["attempt"])
@@ -165,6 +171,10 @@ class Episode:
         if self.random_lib:
             self._end_boot(rt)
         proxy = ModelProxy(recording, self.upstream, clock, self.upstream_headers)
+        if self.timeout and proxy.live_base is None:
+            self.environment.stop()
+            raise ValueError("the recording has no live working time (recorded before it was kept); "
+                             "resume it without --timeout, or rerun the episode")
         if self.state_probes:
             proxy.state_probe = lambda: self._probe(rt, boot_env)
         if self.settle_timeout is not None:
@@ -179,6 +189,7 @@ class Episode:
         argv, host_env, cwd = rt.command([a.format(**subst) for a in self.harness], env)
         record = {"attempt": n, "started": time.time(), "resumed_from_step": recorded or None}
         proc = subprocess.Popen(argv, cwd=cwd, env=host_env, stdin=subprocess.DEVNULL, start_new_session=True)
+        proxy.start_live_clock()
 
         reason: str | None = None
         if self.fault_after_steps is not None and n == 0:
@@ -191,13 +202,18 @@ class Episode:
                     _kill(proc)
             proxy.on_record = fault
 
-        deadline = time.monotonic() + self.timeout if self.timeout else None
+        deadline = time.monotonic() + self.attempt_timeout if self.attempt_timeout else None
+        timed_out = False
         while proc.poll() is None:
             if self._divergence_reports():
                 reason = reason or "diverged"
                 _kill(proc)
+            elif self.timeout and proxy.live_time() > self.timeout:
+                timed_out = reason is None
+                reason = reason or f"episode used its {self.timeout}s of working time"
+                _kill(proc)
             elif deadline and time.monotonic() > deadline:
-                reason = reason or f"timeout after {self.timeout}s"
+                reason = reason or f"attempt timeout after {self.attempt_timeout}s"
                 _kill(proc)
             time.sleep(0.1)
         _kill(proc)  # stray children: MCP relays and servers
@@ -207,7 +223,8 @@ class Episode:
         httpd.server_close()
 
         reports = self._divergence_reports()
-        record |= {"ended": time.time(), "exit_code": proc.returncode, "model_steps": proxy.steps}
+        record |= {"ended": time.time(), "exit_code": proc.returncode, "model_steps": proxy.steps,
+                   "live_time": round(proxy.live_time(), 3)}
         if proxy.settle_timeouts:
             record["settle_timeouts"] = proxy.settle_timeouts
         if proxy.forwarded:
@@ -225,6 +242,8 @@ class Episode:
             record |= {"outcome": "diverged", "reason": "rebuild diverged", "divergence": reports}
         elif reason is None and proc.returncode == 0:
             record |= {"outcome": "completed", "reason": None}
+        elif timed_out:
+            record |= {"outcome": "timed_out", "reason": reason}
         elif proxy.auth_failed and reason is None:
             # Rebuilding cannot fix a credential; stop rather than retry.
             record |= {"outcome": "auth_failed", "reason": f"model API rejected the credential ({proxy.auth_failed})"}
@@ -336,8 +355,16 @@ class Episode:
 
     def _save(self, meta: dict[str, Any]) -> None:
         tmp = self.meta_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(meta, indent=2))
+        with tmp.open("w") as f:
+            f.write(json.dumps(meta, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.meta_path)
+        fd = os.open(self.dir, os.O_RDONLY)
+        try:
+            os.fsync(fd)  # the rename itself survives a crash
+        finally:
+            os.close(fd)
 
 
 def api_key_headers(key: str) -> dict[str, str]:
@@ -384,7 +411,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--clock", choices=["frozen", "advancing"], default="frozen", help="pinned clock mode (see clock.py)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-attempts", type=int, default=4)
-    parser.add_argument("--timeout", type=float, help="seconds per attempt")
+    parser.add_argument("--timeout", type=float,
+                        help="the episode's live working time in seconds, across attempts (replay is not charged); "
+                             "using it up ends the episode as timed_out")
+    parser.add_argument("--attempt-timeout", type=float,
+                        help="wall time per attempt in seconds, replay included; past it the attempt is a hang and is retried")
     parser.add_argument("--no-rerun-on-divergence", action="store_true")
     parser.add_argument("--fault-after-steps", type=int, help="testing: fail the first attempt after N model steps")
     parser.add_argument("--fault", choices=["harness", "environment"], default="harness")
@@ -424,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
         upstream_headers=headers, faketime_lib=args.faketime_lib, random_lib=args.random_lib,
         ready=["sh", "-c", args.ready] if args.ready else None, ready_timeout=args.ready_timeout,
         settle_timeout=args.settle_timeout if args.image and args.settle_timeout > 0 else None, clock_mode=args.clock, seed=args.seed, max_attempts=args.max_attempts,
-        timeout=args.timeout, rerun_on_divergence=not args.no_rerun_on_divergence,
+        timeout=args.timeout, attempt_timeout=args.attempt_timeout, rerun_on_divergence=not args.no_rerun_on_divergence,
         fault_after_steps=args.fault_after_steps, fault=args.fault,
     )
     meta = episode.run()

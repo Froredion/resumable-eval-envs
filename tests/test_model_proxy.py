@@ -313,3 +313,25 @@ def test_only_listed_endpoints_are_passed_through(tmp_path, upstream):
     assert [path for path, _ in upstream.hits] == ["/v1/models?limit=5"]  # the refused one never left
     assert proxy.forwarded == {"GET /v1/models"} and proxy.refused == {"GET /v1/files"}
     proxy.httpd.shutdown()
+
+
+def test_replay_is_not_charged_to_the_time_limit(tmp_path, upstream):
+    rec = tmp_path / "model.jsonl"
+    proxy, port = start(rec, upstream)
+    proxy.start_live_clock()
+    r1 = call(port, turn("A"))
+    call(port, turn("A", r1[2]))
+    proxy.httpd.shutdown()
+    base = Recording(rec).events[-1].meta["live"]
+
+    proxy, port = start(rec, upstream)
+    proxy.start_live_clock()  # something left to replay: not counting yet
+    time.sleep(0.5)
+    call(port, turn("A"))
+    time.sleep(0.5)
+    r2 = call(port, turn("A", r1[2]))  # the last replayed reply: counting from here
+    time.sleep(0.3)
+    call(port, turn("A", r1[2], r2[2]))
+    live = Recording(rec).events[-1].meta["live"]
+    assert base + 0.3 <= live < base + 0.6
+    proxy.httpd.shutdown()

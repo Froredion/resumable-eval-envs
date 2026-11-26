@@ -57,6 +57,15 @@ done, as they did in the original run, however much faster the replay
 is. A timeout is noted in ``settle_timeouts`` and the replay carries on;
 the result checks still decide.
 
+Live time: each recorded reply carries ``live``, the episode's working
+time so far in seconds (fsynced with it, so it survives any crash). A
+proxy on a recording starts from the last recorded value and counts only
+once the recording is exhausted (from the last replayed reply), so replay
+is free and the step lost in a failure is redone without being charged;
+:meth:`live_time` gives the running total, which the orchestrator holds to
+the episode's time limit. On an empty recording it counts from
+:meth:`start_live_clock` (the harness starting).
+
 With a :class:`~resumable_evals.clock.Clock`, each reply pins the
 environment's clock: to now when live (recorded with the event), to the
 recorded time on rebuild.
@@ -209,6 +218,9 @@ class ModelProxy:
         self.overlap_wait = 60.0  # see the module docstring
         self._last_sent = float("-inf")  # monotonic time the last model reply was handed back
         self._steps = len(recording.of_kind("model"))
+        models = recording.of_kind("model")
+        self.live_base: float | None = models[-1].meta.get("live") if models else 0.0  # None: recorded without it
+        self._live_since: float | None = None  # monotonic time live counting started
         self.diverged: Diverged | None = None
         self.auth_failed: int | None = None  # status of the last upstream auth failure on a model call
         self.httpd: ThreadingHTTPServer | None = None
@@ -250,6 +262,17 @@ class ModelProxy:
             return _error(502, f"resumable-evals: upstream unreachable: {e}")
         finally:
             conn.close()
+
+    def start_live_clock(self) -> None:
+        """The harness has started: count from now if nothing is left to replay."""
+        with self._lock:
+            if self._live_since is None and not self.cursor.model_window():
+                self._live_since = time.monotonic()
+
+    def live_time(self) -> float:
+        """The episode's working time so far: recorded, plus this attempt's since replay ended."""
+        base = self.live_base or 0.0
+        return base + (time.monotonic() - self._live_since if self._live_since is not None else 0.0)
 
     def other(self, method: str, path: str, headers: Any, raw: bytes | None) -> Response:
         """Any request but a model call: forwarded unrecorded if on the passthrough list."""
@@ -308,6 +331,8 @@ class ModelProxy:
             reply = self.cursor.take_model(event)
             if self.clock and "t" in event.meta:
                 self.clock.pin(event.meta["t"])
+            if not self.cursor.model_window() and self._live_since is None:
+                self._live_since = time.monotonic()  # the last replayed reply: the agent works live from here
             return reply["status"], [("Content-Type", reply["content_type"])], reply["body"].encode()
         state = self.state_probe() if self.state_probe and not overlaps else None
         status, out, data = self.forward("POST", path, headers, raw)
@@ -315,6 +340,7 @@ class ModelProxy:
         if not unrecorded(status):
             processes = self.processes() if self.processes and not overlaps else None
             t = time.time()
+            live = self.live_time()
             content_type = next((v for k, v in out if k.lower() == "content-type"), "application/json")
             self.recording.append(
                 self._steps,
@@ -322,6 +348,7 @@ class ModelProxy:
                 {"path": path, "shape": shape(body), "body": body},
                 {"status": status, "content_type": content_type, "body": data.decode()},
                 t=t,
+                live=live,
                 **({"state": state} if state is not None else {}),
                 **({"processes": processes} if processes is not None else {}),
                 **({"overlaps_previous": True} if overlaps else {}),

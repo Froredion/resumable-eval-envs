@@ -103,8 +103,11 @@ class StdioProxy:
         if isinstance(data, dict):
             data = json.dumps(data, separators=(",", ":")).encode() + b"\n"
         with self._client_lock:
-            self.client_out.write(data)
-            self.client_out.flush()
+            try:
+                self.client_out.write(data)
+                self.client_out.flush()
+            except OSError:
+                pass  # client gone (harness killed); a reply already recorded is the step the design may lose
 
     def _to_server(self, data: bytes | dict[str, Any]) -> None:
         if isinstance(data, dict):
@@ -124,12 +127,15 @@ class StdioProxy:
                 pass
 
     def _pump_client(self) -> None:
-        for line in self.client_in:
-            msg = _parse(line)
-            if msg is not None and msg.get("method") == "tools/call" and "id" in msg:
-                self._calls.put(msg)
-            else:
-                self._to_server(line)
+        try:
+            for line in self.client_in:
+                msg = _parse(line)
+                if msg is not None and msg.get("method") == "tools/call" and "id" in msg:
+                    self._calls.put(msg)
+                else:
+                    self._to_server(line)
+        except OSError:
+            pass  # the client's connection was reset (the harness was killed): same as it closing
         self._calls.put(None)  # client closed: finish queued calls, then close the server
 
     def _pump_server(self) -> None:
