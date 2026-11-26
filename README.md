@@ -1,5 +1,7 @@
 # resumable-evals
 
+[![CI](https://github.com/Froredion/resumable-eval-envs/actions/workflows/ci.yml/badge.svg)](https://github.com/Froredion/resumable-eval-envs/actions/workflows/ci.yml)
+
 Resume an eval episode that failed partway through, from its last completed step, without changing the harness or the agent.
 
 Environments are offline and their tools deterministic, so nothing is snapshotted. Two proxies record every model call and tool call. After a failure, a fresh container re-executes the recorded tool calls in order and checks each result against the recording. The unmodified harness fast-forwards on recorded model replies, and at the failed step both proxies go live. Design: [docs/DESIGN.md](docs/DESIGN.md).
@@ -15,7 +17,7 @@ Status: alpha. Claude Code on the Anthropic Messages API, with stdio MCP servers
 ## Install
 
 ```sh
-uv tool install git+<repository-url>   # or: pip install git+<repository-url>
+uv tool install git+https://github.com/Froredion/resumable-eval-envs   # or: pip install git+https://github.com/Froredion/resumable-eval-envs
 resumable-evals --help
 ```
 

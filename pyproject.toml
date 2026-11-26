@@ -22,6 +22,11 @@ classifiers = [
     "Topic :: Software Development :: Testing",
 ]
 
+[project.urls]
+Repository = "https://github.com/Froredion/resumable-eval-envs"
+Issues = "https://github.com/Froredion/resumable-eval-envs/issues"
+Design = "https://github.com/Froredion/resumable-eval-envs/blob/main/docs/DESIGN.md"
+
 [project.scripts]
 resumable-evals = "resumable_evals.orchestrator:main"
 
