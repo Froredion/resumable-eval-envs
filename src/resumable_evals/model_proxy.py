@@ -5,8 +5,13 @@ Point the harness at it, e.g. for Claude Code::
     python -m resumable_evals.model_proxy --recording ep/model.jsonl --port 8787
     ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude ...
 
-``POST /v1/messages`` is the model call. Everything else (token counting,
-profile and model listing) is passed through to the upstream unrecorded.
+``POST /v1/messages`` is the model call. Other requests are passed through
+to the upstream unrecorded, but only those in ``passthrough`` (method and
+path; token counting, model and profile reads), since the proxy adds the
+credential to whatever it forwards: anything else in the environment that
+finds the proxy would get the credential's access to the whole API. Other
+requests get a 404 and are listed in ``refused``; ``passthrough=None``
+forwards everything, and lists it in ``forwarded``.
 
 There is no mode flag. While the recording has model replies left, each
 request is answered from it, in order, without contacting the upstream; the
@@ -98,6 +103,16 @@ HOP_BY_HOP = {
     "te", "trailer", "transfer-encoding", "upgrade",
 }
 Response = tuple[int, list[tuple[str, str]], bytes]
+
+
+# Requests other than model calls passed through to the upstream (see the
+# module docstring): read-only ones harnesses use. In a live Claude Code run
+# (-p, MCP and Bash) it made none; anything refused shows in the attempt
+# record (model_api_refused).
+PASSTHROUGH: frozenset[tuple[str, str]] | None = frozenset({
+    ("POST", "/v1/messages/count_tokens"),
+    ("GET", "/v1/models"),
+})
 
 
 def shape(body: dict[str, Any]) -> dict[str, Any]:
@@ -197,6 +212,9 @@ class ModelProxy:
         self.diverged: Diverged | None = None
         self.auth_failed: int | None = None  # status of the last upstream auth failure on a model call
         self.httpd: ThreadingHTTPServer | None = None
+        self.passthrough: frozenset[tuple[str, str]] | None = PASSTHROUGH  # see the module docstring
+        self.forwarded: set[str] = set()  # "METHOD path" passed through
+        self.refused: set[str] = set()  # "METHOD path" not on the passthrough list
 
     @property
     def steps(self) -> int:
@@ -232,6 +250,15 @@ class ModelProxy:
             return _error(502, f"resumable-evals: upstream unreachable: {e}")
         finally:
             conn.close()
+
+    def other(self, method: str, path: str, headers: Any, raw: bytes | None) -> Response:
+        """Any request but a model call: forwarded unrecorded if on the passthrough list."""
+        key = f"{method} {urlsplit(path).path}"
+        if self.passthrough is not None and (method, urlsplit(path).path) not in self.passthrough:
+            self.refused.add(key)
+            return _error(404, f"resumable-evals: {key} is not passed through to the model API", "not_found_error")
+        self.forwarded.add(key)
+        return self.forward(method, path, headers, raw)
 
     def messages(self, path: str, headers: Any, raw: bytes) -> Response:
         try:
@@ -340,7 +367,7 @@ class ModelProxy:
                 if self.command == "POST" and urlsplit(self.path).path == "/v1/messages":
                     status, out, data = proxy.messages(self.path, self.headers, raw or b"")
                 else:
-                    status, out, data = proxy.forward(self.command, self.path, self.headers, raw)
+                    status, out, data = proxy.other(self.command, self.path, self.headers, raw)
                 self.send_response(status)
                 for k, v in out:
                     self.send_header(k, v)

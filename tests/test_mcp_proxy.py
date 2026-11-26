@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from resumable_evals.mcp_proxy import DIVERGED_EXIT
@@ -91,3 +92,25 @@ def test_non_tool_messages_pass_through_unrecorded(tmp_path):
     assert code == 0 and r["init0"]["result"]["serverInfo"]["name"] == "fake"
     assert [t["name"] for t in r[9]["result"]["tools"]] == ["incr", "echo"]
     assert Recording(rec).events == []
+
+
+def test_listener_refuses_a_second_connection(tmp_path):
+    import socket
+    from resumable_evals.mcp_proxy import McpListener
+    (tmp_path / "data").mkdir()
+    listener = McpListener(tmp_path / "mcp.jsonl", ([sys.executable, str(SERVER), str(tmp_path / "data")], None, None), "127.0.0.1")
+    first = socket.create_connection(("127.0.0.1", listener.port))
+    f = first.makefile("rwb")
+    f.write(b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"incr","arguments":{}}}\n')
+    f.flush()
+    assert json.loads(f.readline())["id"] == 1
+    second = socket.create_connection(("127.0.0.1", listener.port))
+    assert second.recv(1) == b""  # closed at once
+    for _ in range(50):
+        if listener.refused:
+            break
+        time.sleep(0.02)
+    assert listener.refused == 1
+    first.close()
+    listener.stop()
+    assert len(Recording(tmp_path / "mcp.jsonl").events) == 1

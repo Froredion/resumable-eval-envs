@@ -209,7 +209,7 @@ def draws_in_fresh_container(image, shared_dir, seed, t=1764000000):
     boot_env = env.clock.env([FAKETIME, RANDPIN], env.platform) | {"RESUMABLE_EVALS_SEED": str(seed),
                                                       "RESUMABLE_EVALS_RANDOM_DIR": env.random_dir}
     try:
-        rt = env.start(shared_dir, boot_env)
+        rt = env.start(boot_env)
         argv, host_env, cwd = rt.command(["python", "-c", DRAWS], boot_env)
         out = subprocess.run(argv, env=host_env, cwd=cwd, capture_output=True, text=True, check=True).stdout
         errors = subprocess.run(["docker", "exec", env.name, "cat", f"{env.random_dir}/errors"], capture_output=True, text=True)
@@ -325,3 +325,39 @@ def test_settling_waits_for_a_background_job_as_the_original_run_did(image, shar
     events = Recording(shared_dir / "episode" / "model.jsonl").events
     assert any("fake_harness.py" in p for p in events[1].meta["processes"])  # the list is the container's
     assert not any("sleep 1" in p for p in events[1].meta["processes"])  # the job was done by step 1's reply
+
+
+# -- isolation ------------------------------------------------------------------
+
+def test_recordings_never_enter_the_environment(image, shared_dir):
+    """The agent cannot find its transcript, the MCP recording or an earlier attempt's archive."""
+    (shared_dir / "episode").mkdir()
+    (shared_dir / "episode" / "diverged-0").mkdir()  # as if an earlier attempt had diverged
+    (shared_dir / "episode" / "diverged-0" / "model.jsonl").write_text("{}\n")
+    up = Upstream(script=[["incr", "snoop"], ["incr", "snoop"]])
+    env = DockerEnvironment(image, f"resumable-test-iso-{shared_dir.name}")
+    ep = Episode(
+        dir=shared_dir / "episode",
+        harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
+        environment=env,
+        mcp_servers={"fake": ["python", "/opt/eval/fake_mcp_server.py", "{workdir}/app_data"]},
+        upstream=up.url,
+        faketime_lib=FAKETIME,
+        timeout=120,
+        fault_after_steps=2,
+        fault="environment",
+    )
+    try:
+        meta = ep.run()
+        mounts = json.loads(subprocess.run(["docker", "inspect", "-f", "{{json .Mounts}}", env.name],
+                                           capture_output=True, text=True, check=True).stdout)
+    finally:
+        env.stop()
+        up.httpd.shutdown()
+    assert [a["outcome"] for a in meta["attempts"]] == ["failed", "completed"], meta
+    assert [m for m in mounts if m["Type"] == "bind"] == []
+    snooped = [r["content"] for e in Recording(shared_dir / "episode" / "model.jsonl").events
+               for m in e.request["body"]["messages"][-1:] if isinstance(m["content"], list)
+               for r in m["content"] if r["tool_use_id"].endswith("_1")]
+    assert snooped == ["nothing", "nothing"]  # step 0 in the original run, step 1 after the rebuild
+    assert len(Recording(shared_dir / "episode" / "mcp-fake.jsonl").events) == 2  # recorded on the host, through the relay

@@ -119,8 +119,8 @@ class DirtyOnRebuild(DirEnvironment):
 
     starts = 0
 
-    def start(self, episode_dir, boot_env):
-        rt = super().start(episode_dir, boot_env)
+    def start(self, boot_env):
+        rt = super().start(boot_env)
         work = Path(rt.workdir)
         self.starts += 1
         if self.starts == 2:

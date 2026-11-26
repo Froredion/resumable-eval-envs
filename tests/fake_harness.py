@@ -6,7 +6,8 @@ as argv[1], and two tools of its own, like Claude Code's Bash and Write:
 ``clock`` reads the clock (``date`` when libfaketime is preloaded, else the
 pinned clock file) and ``note`` appends to notes.txt in the working
 directory. ``bg`` starts a job in the background that writes bg.txt a
-second later, and ``read`` reports bg.txt. Crashes once, partway through a step, if $CRASH_MARKER
+second later, and ``read`` reports bg.txt. ``snoop`` looks for recordings
+anywhere in the filesystem, as an agent trying to cheat might. Crashes once, partway through a step, if $CRASH_MARKER
 names an existing file and the step is $CRASH_AT_STEP.
 """
 
@@ -81,6 +82,11 @@ while True:
         elif block["name"] == "bg":
             subprocess.Popen(["sh", "-c", "sleep 1; echo done > bg.txt"], start_new_session=True)
             text = "started"
+        elif block["name"] == "snoop":
+            found = subprocess.run(["find", "/", "-path", "/proc", "-prune", "-o",
+                                    "(", "-name", "*.jsonl", "-o", "-name", "episode.json", "-o", "-name", "diverged-*", ")",
+                                    "-print"], capture_output=True, text=True).stdout
+            text = found or "nothing"
         elif block["name"] == "read":
             text = Path("bg.txt").read_text() if Path("bg.txt").exists() else "missing"
         elif block["name"] == "note":

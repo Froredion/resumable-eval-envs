@@ -8,12 +8,15 @@ variables those services need (pinned clock, seeds) and returns a
 and host names things have as seen from inside it.
 
 - :class:`DockerEnvironment` (the real one): a new container from the base
-  image per attempt. The harness, the MCP proxies and the MCP servers run
-  inside it via ``docker exec``. The episode directory (recordings, MCP
-  config) is bind-mounted, so recordings outlive the container. The pinned
-  clock file lives in the container itself, and the container is created
-  with the clock variables, so the image's services (Postgres) run on it.
-  The model proxy stays on the host, reached at ``host.docker.internal``.
+  image per attempt. The harness and the MCP servers run inside it via
+  ``docker exec``. Nothing of the episode directory is mounted: the
+  recordings stay on the host, where the proxies run, so the agent can
+  neither read them (an earlier attempt's transcript included) nor change
+  them. The harness reaches the proxies at ``host.docker.internal``: the
+  model proxy over HTTP, each MCP proxy through a small relay copied into
+  the container (see ``relay.py``). The pinned clock file lives in the
+  container itself, and the container is created with the clock variables,
+  so the image's services (Postgres) run on it.
 - :class:`DirEnvironment`: a fresh copy of a directory, for local work and
   tests without Docker.
 """
@@ -32,7 +35,6 @@ from typing import Callable, Protocol
 
 from .clock import Clock
 
-PACKAGE_ROOT = Path(__file__).resolve().parent.parent  # directory containing resumable_evals/
 CONTAINER_CLOCK = "/run/resumable-evals/clock"
 CONTAINER_RANDOM = "/run/resumable-evals/random"
 
@@ -42,11 +44,10 @@ Command = tuple[list[str], dict[str, str], str | None]  # argv, host process env
 @dataclass
 class Runtime:
     workdir: str  # harness working directory, as seen inside
-    episode: str  # episode directory, as seen inside
-    model_host: str  # host name of the model proxy, as seen inside
-    python: list[str]  # runs Python inside, with python_env making resumable_evals importable
-    python_env: dict[str, str]
+    model_host: str  # host name of the proxies, as seen inside
+    python: list[str]  # runs Python inside
     command: Callable[[list[str], dict[str, str]], Command]  # run argv inside with these env vars
+    put: Callable[[str, str], str]  # put a file (name, content) inside for the harness; returns its path inside
 
 
 class Environment(Protocol):
@@ -55,7 +56,7 @@ class Environment(Protocol):
     clock: Clock  # the environment's pinned clock; pins before start take effect at boot
     random_dir: str  # where the randomness shim keeps its counters, as seen inside; empty at every start
 
-    def start(self, episode_dir: Path, boot_env: dict[str, str]) -> Runtime:
+    def start(self, boot_env: dict[str, str]) -> Runtime:
         """Tear down any previous instance and bring up a fresh one from the base.
 
         ``boot_env`` is set for everything in the environment, its own
@@ -92,21 +93,27 @@ class DirEnvironment:
     def __post_init__(self) -> None:
         self.clock = Clock(self.workdir.with_name(self.workdir.name + ".clock"))
         self.random_dir = str(self.workdir.with_name(self.workdir.name + ".random"))
+        self._files = self.workdir.with_name(self.workdir.name + ".run")
 
-    def start(self, episode_dir: Path, boot_env: dict[str, str]) -> Runtime:
-        for d in (self.workdir, Path(self.random_dir)):
+    def start(self, boot_env: dict[str, str]) -> Runtime:
+        for d in (self.workdir, Path(self.random_dir), self._files):
             if d.exists():
                 shutil.rmtree(d)
         shutil.copytree(self.base, self.workdir, symlinks=True)
         Path(self.random_dir).mkdir(mode=0o777)
+        self._files.mkdir()
         workdir = str(self.workdir)
+
+        def put(name: str, content: str) -> str:
+            (self._files / name).write_text(content)
+            return str(self._files / name)
+
         return Runtime(
             workdir=workdir,
-            episode=str(episode_dir),
             model_host="127.0.0.1",
             python=[sys.executable],
-            python_env={},
             command=lambda argv, env: (argv, dict(os.environ) | env, workdir),
+            put=put,
         )
 
     def stop(self) -> None:
@@ -124,8 +131,8 @@ class DockerEnvironment:
     """A new container from ``image`` per attempt.
 
     The image's own command must keep the container up (start its services,
-    then wait); the harness is run with ``docker exec``. Python 3.9+ must be
-    on the image's PATH as ``python``, for the MCP proxy.
+    then wait); the harness is run with ``docker exec``. Python 3.8+ must be
+    on the image's PATH as ``python``, for the MCP relay.
 
     Nothing may carry state from one attempt to the next, or the rebuild
     would start from a dirty environment: containers are removed with their
@@ -133,8 +140,6 @@ class DockerEnvironment:
     listed in ``volumes`` are recreated empty per attempt, and ``run_args``
     may not mount a named volume or a writable host directory.
 
-    On Docker Desktop for macOS the episode directory must be somewhere
-    Docker shares (under ``$HOME``), or the container gets an empty mount.
     On Linux, ``proxy_bind`` must be an address the container can reach,
     such as the bridge gateway (172.17.0.1); not 0.0.0.0, which would offer
     the proxy, and the credentials it adds, to the whole network.
@@ -146,7 +151,6 @@ class DockerEnvironment:
     run_args: list[str] = field(default_factory=list)  # e.g. --network, --memory, read-only mounts
     volumes: dict[str, str] = field(default_factory=dict)  # name -> path inside; recreated empty every attempt
     proxy_bind: str = "127.0.0.1"
-    episode_mount: str = "/resumable"
     python: str = "python"
     platform: str = "linux"
     clock: Clock = field(init=False)
@@ -158,13 +162,11 @@ class DockerEnvironment:
         self._staged_clock: str | None = None
         self._running = False
 
-    def start(self, episode_dir: Path, boot_env: dict[str, str]) -> Runtime:
+    def start(self, boot_env: dict[str, str]) -> Runtime:
         self.stop()
         env_flags = [x for k, v in boot_env.items() for x in ("-e", f"{k}={v}")]
         _docker("create", "--name", self.name,
                 "--add-host", "host.docker.internal:host-gateway",
-                "-v", f"{episode_dir.resolve()}:{self.episode_mount}",
-                "-v", f"{PACKAGE_ROOT}:/opt/resumable-evals:ro",
                 *(x for key, path in self.volumes.items() for x in ("-v", f"{self._volume(key)}:{path}")),
                 *env_flags, *self.run_args, self.image)
         # In place before the image's command starts its services: the clock,
@@ -193,13 +195,17 @@ class DockerEnvironment:
             flags = [x for k, v in env.items() for x in ("-e", f"{k}={v}")]
             return ["docker", "exec", "-i", "-w", self.workdir, *flags, self.name, *argv], dict(os.environ), None
 
+        def put(name: str, content: str) -> str:
+            path = f"{os.path.dirname(CONTAINER_CLOCK)}/{name}"
+            _docker("exec", "-i", self.name, "sh", "-c", f"cat > {path}", input=content)
+            return path
+
         return Runtime(
             workdir=self.workdir,
-            episode=self.episode_mount,
             model_host="host.docker.internal",
             python=[self.python],
-            python_env={"PYTHONPATH": "/opt/resumable-evals"},
             command=command,
+            put=put,
         )
 
     def _write_clock(self, text: str) -> None:

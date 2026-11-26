@@ -4,8 +4,11 @@ Each attempt starts a fresh environment (see ``environments``), a model
 proxy on the episode's recording, and the unmodified harness inside the
 environment. The harness is pointed at the model proxy with
 ``ANTHROPIC_BASE_URL`` and at its MCP servers through a generated MCP config
-(``{mcp_config}`` in the harness command) that wraps every server in the MCP
-proxy, also inside the environment. Determinism controls (pinned clock,
+(``{mcp_config}`` in the harness command) that runs a relay to each server's
+MCP proxy. Both proxies run here, on the host, and so do the recordings:
+nothing of the episode directory enters the environment, so the agent can
+neither read an earlier attempt's transcript nor change what a rebuild is
+checked against. Determinism controls (pinned clock,
 seeds, and pinned randomness with ``random_lib``) apply to every attempt,
 the original included. The seed is kept in ``episode.json``, so a resume
 cannot change it.
@@ -49,11 +52,13 @@ from pathlib import Path
 from typing import Any
 
 from .environments import DirEnvironment, DockerEnvironment, Environment, Runtime
+from .mcp_proxy import McpListener
 from .model_proxy import ModelProxy
 from .recording import Recording
 
 
-# Lists /proc inside the environment: every process but itself, by command line.
+# Lists /proc inside the environment: every process but itself and the MCP
+# relays (ours, and their port differs every attempt), by command line.
 # Zombies and kernel threads have none. Ports in rewritten titles (a Postgres
 # backend's "127.0.0.1(54321)") differ between runs and are masked.
 PROCESS_LIST = r"""
@@ -67,7 +72,7 @@ for pid in os.listdir("/proc"):
     except OSError:
         continue
     cmd = cmd.replace(b"\0", b" ").decode(errors="replace").strip()
-    if cmd:
+    if cmd and "mcp-relay.py" not in cmd:
         out.append(re.sub(r"\(\d+\)", "(N)", cmd))
 print(json.dumps(sorted(out)))
 """
@@ -151,7 +156,7 @@ class Episode:
         }
         if self.random_lib:
             boot_env["RESUMABLE_EVALS_RANDOM_DIR"] = self.environment.random_dir
-        rt = self.environment.start(self.dir, boot_env)
+        rt = self.environment.start(boot_env)
         if self.ready and not self._wait_ready(rt, boot_env):
             self.environment.stop()
             return {"attempt": n, "started": time.time(), "resumed_from_step": recorded or None, "ended": time.time(),
@@ -168,8 +173,8 @@ class Episode:
         httpd = proxy.serve(self.environment.proxy_bind)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
-        self._write_mcp_config(rt)
-        subst = {"workdir": rt.workdir, "mcp_config": f"{rt.episode}/mcp.json", "episode": rt.episode}
+        listeners = self._start_mcp(rt, boot_env | self.env)
+        subst = {"workdir": rt.workdir, "mcp_config": self._put_mcp_config(rt, listeners)}
         env = boot_env | {"ANTHROPIC_BASE_URL": f"http://{rt.model_host}:{httpd.server_address[1]}"} | self.env
         argv, host_env, cwd = rt.command([a.format(**subst) for a in self.harness], env)
         record = {"attempt": n, "started": time.time(), "resumed_from_step": recorded or None}
@@ -195,7 +200,9 @@ class Episode:
                 reason = reason or f"timeout after {self.timeout}s"
                 _kill(proc)
             time.sleep(0.1)
-        _kill(proc)  # stray children: MCP proxies and servers
+        _kill(proc)  # stray children: MCP relays and servers
+        for listener in listeners.values():
+            listener.stop()  # recordings final before anything reads them
         httpd.shutdown()
         httpd.server_close()
 
@@ -203,6 +210,13 @@ class Episode:
         record |= {"ended": time.time(), "exit_code": proc.returncode, "model_steps": proxy.steps}
         if proxy.settle_timeouts:
             record["settle_timeouts"] = proxy.settle_timeouts
+        if proxy.forwarded:
+            record["model_api_passed_through"] = sorted(proxy.forwarded)
+        if proxy.refused:
+            record["model_api_refused"] = sorted(proxy.refused)
+        refused = {name: l.refused for name, l in listeners.items() if l.refused}
+        if refused:
+            record["mcp_connections_refused"] = refused
         if self.random_lib:
             fallbacks = self._random_fallbacks(rt)
             if fallbacks:
@@ -270,17 +284,22 @@ class Episode:
         p = subprocess.run(cmd, env=host_env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
         return p.stdout.splitlines() if p.returncode == 0 else []
 
-    def _write_mcp_config(self, rt: Runtime) -> None:
-        servers = {
-            name: {
-                "command": rt.python[0],
-                "args": [*rt.python[1:], "-m", "resumable_evals.mcp_proxy", "--recording", f"{rt.episode}/mcp-{name}.jsonl",
-                         "--", *(a.format(workdir=rt.workdir) for a in argv)],
-                "env": rt.python_env,
-            }
+    def _start_mcp(self, rt: Runtime, env: dict[str, str]) -> dict[str, McpListener]:
+        """An MCP proxy per server, here on the host, waiting for the harness's relay."""
+        return {
+            name: McpListener(self.dir / f"mcp-{name}.jsonl", rt.command([a.format(workdir=rt.workdir) for a in argv], env),
+                              self.environment.proxy_bind)
             for name, argv in self.mcp_servers.items()
         }
-        (self.dir / "mcp.json").write_text(json.dumps({"mcpServers": servers}, indent=2))
+
+    def _put_mcp_config(self, rt: Runtime, listeners: dict[str, McpListener]) -> str:
+        """Put the relay and the harness's MCP config in the environment; return the config's path inside."""
+        relay = rt.put("mcp-relay.py", (Path(__file__).parent / "relay.py").read_text())
+        servers = {
+            name: {"command": rt.python[0], "args": [*rt.python[1:], relay, rt.model_host, str(listener.port)]}
+            for name, listener in listeners.items()
+        }
+        return rt.put("mcp.json", json.dumps({"mcpServers": servers}, indent=2))
 
     def _divergence_reports(self) -> list[dict[str, Any]]:
         out = []

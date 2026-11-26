@@ -301,3 +301,15 @@ def test_settle_timeout_is_noted_and_the_replay_carries_on(tmp_path, upstream):
     assert call(port, msgs(1)) == first
     assert proxy.settle_timeouts == [{"step": 0, "still_running": ["server --port 8000"]}]
     proxy.httpd.shutdown()
+
+
+def test_only_listed_endpoints_are_passed_through(tmp_path, upstream):
+    """The proxy adds the credential, so it forwards only what the harness needs."""
+    proxy, port = start(tmp_path / "model.jsonl", upstream, headers={"Authorization": f"Bearer {TOKEN}"})
+    proxy.passthrough = frozenset({("GET", "/v1/models")})
+    assert call(port, None, method="GET", path="/v1/models?limit=5")[0] == 200
+    status, _, body = call(port, None, method="GET", path="/v1/files")
+    assert status == 404 and "not passed through" in json.loads(body)["error"]["message"]
+    assert [path for path, _ in upstream.hits] == ["/v1/models?limit=5"]  # the refused one never left
+    assert proxy.forwarded == {"GET /v1/models"} and proxy.refused == {"GET /v1/files"}
+    proxy.httpd.shutdown()

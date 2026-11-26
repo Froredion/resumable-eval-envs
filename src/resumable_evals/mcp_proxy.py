@@ -18,6 +18,11 @@ appends each call, fsynced, before the reply reaches the harness.
 On divergence the harness gets a JSON-RPC error for that call, details are
 written to ``<recording>.diverged.json``, the server is stopped and the proxy
 exits with status 3. See docs/DESIGN.md.
+
+The orchestrator runs it on the host, behind a :class:`McpListener`: the
+harness inside the environment launches ``relay.py``, which connects to the
+listener, and the real server is started inside the environment with
+``docker exec``. The recording never enters the environment.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import argparse
 import json
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -56,12 +62,13 @@ def _parse(line: bytes) -> dict[str, Any] | None:
 
 
 class StdioProxy:
-    def __init__(self, recording: Recording, server_cmd: list[str], client_in: BinaryIO, client_out: BinaryIO):
+    def __init__(self, recording: Recording, server_cmd: list[str], client_in: BinaryIO, client_out: BinaryIO,
+                 env: dict[str, str] | None = None, cwd: str | None = None):
         self.recording = recording
         self.cursor = RebuildCursor(recording)
         self.client_in = client_in
         self.client_out = client_out
-        self.server = subprocess.Popen(server_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.server = subprocess.Popen(server_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, cwd=cwd)
         self.diverged: Diverged | None = None
         self._tool_count = len(recording.of_kind("tool"))
         self._calls: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -196,6 +203,66 @@ class StdioProxy:
         )
         self.server.terminate()
         self._stop.set()
+
+
+class McpListener:
+    """One MCP server's proxy, on the host, for one attempt.
+
+    Listens on ``bind`` (a free port: :attr:`port`); the first connection,
+    from ``relay.py`` in the environment, gets a :class:`StdioProxy` on
+    ``recording_path`` with the server started by ``server`` (argv, process
+    env, cwd: a command that runs it inside the environment). A second
+    connection is refused and counted in :attr:`refused`: its proxy would
+    start the recording over from the first call.
+    """
+
+    def __init__(self, recording_path: Path, server: tuple[list[str], dict[str, str], str | None], bind: str):
+        self.recording_path = recording_path
+        self.server = server
+        self.sock = socket.create_server((bind, 0))
+        self.port: int = self.sock.getsockname()[1]
+        self.refused = 0
+        self.proxy: StdioProxy | None = None
+        self._conn: socket.socket | None = None
+        self._serving: threading.Thread | None = None
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return  # stopped
+            if self.proxy is not None:
+                self.refused += 1
+                conn.close()
+                continue
+            argv, env, cwd = self.server
+            self._conn = conn
+            self.proxy = StdioProxy(Recording(self.recording_path), argv, conn.makefile("rb"), conn.makefile("wb"), env, cwd)
+            self._serving = threading.Thread(target=self._serve, daemon=True)
+            self._serving.start()
+
+    def _serve(self) -> None:
+        assert self.proxy is not None and self._conn is not None
+        try:
+            self.proxy.run()
+        finally:
+            self._conn.close()
+
+    def stop(self) -> None:
+        """Close the connection and wait for the proxy, so the recording is final."""
+        self.sock.close()
+        if self._conn is not None:
+            try:
+                self._conn.shutdown(socket.SHUT_RDWR)  # the proxy sees the client go
+            except OSError:
+                pass
+        if self._serving is not None:
+            self._serving.join(15)
+            if self._serving.is_alive() and self.proxy is not None:
+                self.proxy.server.kill()
+                self._serving.join(15)
 
 
 def main(argv: list[str] | None = None) -> int:
