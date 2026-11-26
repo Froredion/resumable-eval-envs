@@ -60,7 +60,6 @@ from .mcp_proxy import McpListener
 from .model_proxy import ModelProxy
 from .recording import Recording
 
-
 # Lists /proc inside the environment: every process but itself and the MCP
 # relays (ours, and their port differs every attempt), by command line.
 # Zombies and kernel threads have none. Ports in rewritten titles (a Postgres
@@ -236,7 +235,7 @@ class Episode:
             record["model_api_passed_through"] = sorted(proxy.forwarded)
         if proxy.refused:
             record["model_api_refused"] = sorted(proxy.refused)
-        refused = {name: l.refused for name, l in listeners.items() if l.refused}
+        refused = {name: lst.refused for name, lst in listeners.items() if lst.refused}
         if refused:
             record["mcp_connections_refused"] = refused
         if self.random_lib:
@@ -396,7 +395,7 @@ def _kill(proc: subprocess.Popen) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m resumable_evals.orchestrator", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="resumable-evals", description=__doc__.splitlines()[0])
     parser.add_argument("--episode", required=True, type=Path, help="episode directory (recordings, episode.json)")
     parser.add_argument("--image", help="Docker image: a fresh container per attempt")
     parser.add_argument("--name", help="container name (default: from the episode directory)")

@@ -1,18 +1,19 @@
 """End-to-end in Docker: the environment (container) dies mid-episode and is rebuilt from its image."""
 
 import json
+import os
 import shutil
 import subprocess
 import uuid
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
+from test_orchestrator import Upstream
 
 from resumable_evals.environments import DockerEnvironment
 from resumable_evals.orchestrator import Episode
 from resumable_evals.recording import Recording
-
-from test_orchestrator import Upstream
 
 HERE = Path(__file__).parent
 IMAGE = "resumable-evals-test:latest"
@@ -26,6 +27,14 @@ def docker_ok():
 
 
 pytestmark = pytest.mark.skipif(not docker_ok(), reason="Docker not available")
+
+# Where the proxies listen. 127.0.0.1 works on macOS (Docker Desktop, colima);
+# on a Linux host, set this to the bridge gateway (e.g. 172.17.0.1).
+PROXY_BIND = os.environ.get("RESUMABLE_EVALS_TEST_PROXY_BIND", "127.0.0.1")
+
+
+def docker_env(*args, **kwargs) -> DockerEnvironment:
+    return DockerEnvironment(*args, proxy_bind=PROXY_BIND, **kwargs)
 
 
 @pytest.fixture(scope="session")
@@ -52,7 +61,7 @@ def upstream():
 
 
 def test_container_killed_mid_episode_is_rebuilt(image, shared_dir, upstream):
-    env = DockerEnvironment(image, f"resumable-test-{shared_dir.name}")
+    env = docker_env(image, f"resumable-test-{shared_dir.name}")
     ep = Episode(
         dir=shared_dir / "episode",
         harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
@@ -78,7 +87,7 @@ def test_container_killed_mid_episode_is_rebuilt(image, shared_dir, upstream):
 
         # Inside the container, `date` read the pinned step time, in the original run and on rebuild.
         events = Recording(shared_dir / "episode" / "model.jsonl").events
-        for prev, ev in zip(events, events[1:]):
+        for prev, ev in pairwise(events):
             clock = [r["content"] for r in ev.request["body"]["messages"][-1]["content"] if r["tool_use_id"].endswith("_1")]
             assert clock == [f"{int(prev.meta['t'])}\n"]
         assert len(Recording(shared_dir / "episode" / "mcp-fake.jsonl").events) == 3
@@ -110,7 +119,7 @@ def test_postgres_rebuilt_by_reexecution(pg_image, shared_dir, upstream):
     events table is checked against the recording at every step.
     """
     before = dangling_volumes()
-    env = DockerEnvironment(pg_image, f"resumable-test-pg-{shared_dir.name}",
+    env = docker_env(pg_image, f"resumable-test-pg-{shared_dir.name}",
                             volumes={"pgdata": "/var/lib/postgresql/data"})
     ep = Episode(
         state_probes={"events": [*PSQL, "SELECT id, created_at FROM events ORDER BY id"]},
@@ -148,7 +157,7 @@ def test_postgres_rebuilt_by_reexecution(pg_image, shared_dir, upstream):
 
 
 def hidden_effect_episode(pg_image, shared_dir, upstream, probes):
-    env = DockerEnvironment(pg_image, f"resumable-test-hid-{shared_dir.name}")
+    env = docker_env(pg_image, f"resumable-test-hid-{shared_dir.name}")
     ep = Episode(
         dir=shared_dir / "episode",
         harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
@@ -204,7 +213,7 @@ print(os.read(r, 8).hex(), os.urandom(8).hex())
 
 
 def draws_in_fresh_container(image, shared_dir, seed, t=1764000000):
-    env = DockerEnvironment(image, f"resumable-test-rnd-{shared_dir.name}")
+    env = docker_env(image, f"resumable-test-rnd-{shared_dir.name}")
     env.clock.pin(t)
     boot_env = env.clock.env([FAKETIME, RANDPIN], env.platform) | {"RESUMABLE_EVALS_SEED": str(seed),
                                                       "RESUMABLE_EVALS_RANDOM_DIR": env.random_dir}
@@ -223,7 +232,7 @@ def test_random_shim_replays_in_a_fresh_container(image, shared_dir):
     first = draws_in_fresh_container(image, shared_dir, seed=0)
     assert draws_in_fresh_container(image, shared_dir, seed=0) == first
     other = draws_in_fresh_container(image, shared_dir, seed=7)
-    assert all(a != b for a, b in zip(first, other))
+    assert all(a != b for a, b in zip(first, other, strict=True))
     uuid_a, uuid_b = first[0].split()
     assert uuid_a != uuid_b  # two draws in one step differ
     child, parent = first[3].split()
@@ -231,7 +240,7 @@ def test_random_shim_replays_in_a_fresh_container(image, shared_dir):
 
 
 def uuid_episode(pg_image, shared_dir, upstream, random_lib):
-    env = DockerEnvironment(pg_image, f"resumable-test-uuid-{shared_dir.name}", volumes={"pgdata": "/var/lib/postgresql/data"})
+    env = docker_env(pg_image, f"resumable-test-uuid-{shared_dir.name}", volumes={"pgdata": "/var/lib/postgresql/data"})
     ep = Episode(
         dir=shared_dir / "episode",
         harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
@@ -284,7 +293,7 @@ def background_episode(image, shared_dir, settle_timeout):
     once, so without settling the read comes too early.
     """
     up = Upstream(script=[["bg"], ["read"]], delay=2)
-    env = DockerEnvironment(image, f"resumable-test-bg-{shared_dir.name}")
+    env = docker_env(image, f"resumable-test-bg-{shared_dir.name}")
     ep = Episode(
         dir=shared_dir / "episode",
         harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
@@ -335,7 +344,7 @@ def test_recordings_never_enter_the_environment(image, shared_dir):
     (shared_dir / "episode" / "diverged-0").mkdir()  # as if an earlier attempt had diverged
     (shared_dir / "episode" / "diverged-0" / "model.jsonl").write_text("{}\n")
     up = Upstream(script=[["incr", "snoop"], ["incr", "snoop"]])
-    env = DockerEnvironment(image, f"resumable-test-iso-{shared_dir.name}")
+    env = docker_env(image, f"resumable-test-iso-{shared_dir.name}")
     ep = Episode(
         dir=shared_dir / "episode",
         harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
@@ -372,7 +381,7 @@ def queue_episode(pg_image, shared_dir, idle):
     is fast enough to cancel it first, unless it waits for the queue to drain.
     """
     up = Upstream(script=[["order"], ["cancel"]], delay=2)
-    env = DockerEnvironment(pg_image, f"resumable-test-q-{shared_dir.name}")
+    env = docker_env(pg_image, f"resumable-test-q-{shared_dir.name}")
     ep = Episode(
         dir=shared_dir / "episode",
         harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],

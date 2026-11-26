@@ -40,8 +40,8 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Callable, Sequence
 
 
 class Clock:
@@ -80,7 +80,7 @@ class Clock:
             # create libfaketime's per-PID semaphore and exits.
             "FAKETIME_DISABLE_SHM": "1",
         }
-        libs = [l for l in ([lib] if isinstance(lib, str) else lib or []) if l]
+        libs = [x for x in ([lib] if isinstance(lib, str) else lib or []) if x]
         if libs:
             if platform == "darwin":
                 env |= {"DYLD_INSERT_LIBRARIES": ":".join(libs), "DYLD_FORCE_FLAT_NAMESPACE": "1"}

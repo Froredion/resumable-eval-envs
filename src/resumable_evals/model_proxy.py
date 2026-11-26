@@ -104,9 +104,10 @@ import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlsplit
 
 from .clock import Clock

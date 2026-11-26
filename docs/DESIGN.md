@@ -1,6 +1,6 @@
 # Resumable AI Eval Environments
 
-Oct 29, 2026 · @Erickson
+Erickson Talaue · first written Oct 29, 2026, updated as the build progressed
 
 ## Summary
 
@@ -52,7 +52,25 @@ What this means for the design:
 
 Harnesses never talk to models or tools directly; every call passes through the proxy layer, which is what makes resume harness-agnostic.
 
-&#91;embedded content: architecture · proxy layer, checkpointing, orchestrator\]
+```
+             host                                        environment (container)
+ ┌─────────────────────────────────────┐          ┌──────────────────────────────────┐
+ │ Orchestrator                        │  start / │                                  │
+ │  failure detection, rebuild,        │── stop ─▶│  Harness (unmodified)            │
+ │  live/replay switch, tagging        │          │   │                    │         │
+ │                                     │          │   │ model API          │ stdio   │
+ │ Model proxy ◀───────────────────────┼──────────┼───┘                    ▼         │
+ │   │  record / replay replies        │          │                     MCP relay    │
+ │   ▼                                 │          │                        │         │
+ │ Model provider                      │          │                        │         │
+ │                                     │          │                        │         │
+ │ MCP proxy (one per server) ◀────────┼──────────┼────────────────────────┘         │
+ │   │  record / re-execute + check    │          │                                  │
+ │   └─────────── docker exec ─────────┼─────────▶│  MCP servers ── app_data/, DB    │
+ │                                     │          │                                  │
+ │ Recording store (JSONL, fsynced)    │          │  clock + random pinned per step  │
+ └─────────────────────────────────────┘          └──────────────────────────────────┘
+```
 
 - **Model proxy:** all model API traffic goes through it. It records the full transcript for any harness, and on rebuild answers model requests from the recording so the harness fast-forwards.
 - **MCP proxy:** agents connect to it instead of directly to MCP servers. It records tool calls and results, and on rebuild re-executes each recorded call against the fresh environment and checks the result.

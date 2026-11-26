@@ -96,6 +96,7 @@ def test_non_tool_messages_pass_through_unrecorded(tmp_path):
 
 def test_listener_refuses_a_second_connection(tmp_path):
     import socket
+
     from resumable_evals.mcp_proxy import McpListener
     (tmp_path / "data").mkdir()
     listener = McpListener(tmp_path / "mcp.jsonl", ([sys.executable, str(SERVER), str(tmp_path / "data")], None, None), "127.0.0.1")

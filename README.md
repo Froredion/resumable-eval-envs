@@ -4,6 +4,23 @@ Resume an eval episode that failed partway through, from its last completed step
 
 Environments are offline and their tools deterministic, so nothing is snapshotted. Two proxies record every model call and tool call. After a failure, a fresh container re-executes the recorded tool calls in order and checks each result against the recording. The unmodified harness fast-forwards on recorded model replies, and at the failed step both proxies go live. Design: [docs/DESIGN.md](docs/DESIGN.md).
 
+Status: alpha. Claude Code on the Anthropic Messages API, with stdio MCP servers, in single-container Docker environments.
+
+## Requirements
+
+- Python 3.12+ (the core has no runtime dependencies)
+- Docker, for container environments: Docker Desktop or colima on macOS, Docker Engine on Linux
+- An eval image with libfaketime ≥ 0.9.11 and, to pin random values, the `librandpin.so` shim built from `src/resumable_evals/shim` (see [`examples/claude-code/Dockerfile`](examples/claude-code/Dockerfile))
+
+## Install
+
+```sh
+uv tool install git+<repository-url>   # or: pip install git+<repository-url>
+resumable-evals --help
+```
+
+From a checkout: `uv sync`, then `uv run resumable-evals --help` (also `python -m resumable_evals`).
+
 ## Layout
 
 | Path | What |
@@ -28,7 +45,8 @@ Run Claude Code in a container, with one MCP server, resuming on failure:
 
 ```sh
 docker build --build-context randpin=src/resumable_evals/shim -t eval-cc examples/claude-code
-inf uv run python -m resumable_evals.orchestrator \
+export CLAUDE_CODE_OAUTH_TOKEN=...   # stays on the host; the proxy adds it upstream
+resumable-evals \
   --episode ~/runs/ep1 --image eval-cc --workdir /work \
   --mcp "counter=python /opt/eval/counter_mcp_server.py {workdir}/app_data" \
   --faketime-lib /usr/local/lib/libfaketime.so.1 --random-lib /usr/local/lib/librandpin.so \
@@ -41,11 +59,37 @@ inf uv run python -m resumable_evals.orchestrator \
   claude -p "<task>" --mcp-config {mcp_config} --strict-mcp-config --allowedTools ...
 ```
 
-The harness and the MCP servers run in the container. The proxies run on the host, and so do the recordings: nothing of the episode directory is mounted into the container, so the agent can't read its transcript or an earlier attempt's, nor change what a rebuild is checked against. The harness's MCP config launches a small relay (copied into the container) that connects to each server's MCP proxy; the proxy starts the real server in the container with `docker exec`. The model proxy adds the credential (from the host variable named by `--api-key-env` or `--oauth-token-env`), so the agent only ever sees the placeholder. `~/runs/ep1/episode.json` gets the status, every attempt, and `resumed` / `resumed_from_steps` for filtering. After a completed episode the container stays up for grading. `--fault-after-steps N --fault environment` kills the first attempt's container after N model steps, to try resume on demand. An image that should pin random values builds `librandpin.so` from `src/resumable_evals/shim` (see the example Dockerfile) and gets `--random-lib`. `--ready` holds the harness until the image's own services are up, in every attempt. `--settle-timeout` (default 30 s, 0 to turn off) bounds how long a replayed reply waits for background jobs. `--idle` is a command that succeeds when no queued background work is pending (the example checks a Celery queue in Redis); a rebuild waits for it wherever the original run was idle. `--timeout` is the episode's live working time, across attempts: replay isn't charged, a resumed attempt carries on from the time already used, and running out ends the episode as `timed_out`. `--attempt-timeout` is a wall-clock limit per attempt, for hangs, and is retried. Without Docker, `--base DIR --workdir DIR` copies a directory fresh per attempt instead.
+The harness and the MCP servers run in the container. The proxies run on the host, and so do the recordings: nothing of the episode directory is mounted into the container, so the agent can't read its transcript or an earlier attempt's, nor change what a rebuild is checked against. The harness's MCP config launches a small relay (copied into the container) that connects to each server's MCP proxy; the proxy starts the real server in the container with `docker exec`. The model proxy adds the credential, so the agent only ever sees the placeholder.
+
+`~/runs/ep1/episode.json` gets the status, every attempt, and `resumed` / `resumed_from_steps` for filtering. After a completed episode the container stays up for grading. Without Docker, `--base DIR --workdir DIR` copies a directory fresh per attempt instead.
+
+On a Linux host, set `--proxy-bind` to the Docker bridge gateway (see [Security](#security)).
+
+### Options
+
+| Flag | What it does |
+| --- | --- |
+| `--api-key-env VAR` / `--oauth-token-env VAR` | Host variable holding the credential the model proxy adds upstream. It is removed from the orchestrator's environment and never enters the container. |
+| `--mcp NAME=COMMAND` | An MCP server to start in the container behind its own proxy (repeat for more). `{workdir}` expands. `{mcp_config}` in the harness command expands to the generated MCP config. |
+| `--faketime-lib PATH` | libfaketime inside the image; pins the clock per step. |
+| `--random-lib PATH` | `librandpin.so` inside the image; pins random values per step. |
+| `--clock frozen\|advancing` | Pinned clock mode (default frozen). |
+| `--seed N` | Seed for the randomness shim and `PYTHONHASHSEED`; a resume with another seed is refused. |
+| `--max-attempts N` | Attempts before the episode is marked failed (default 4). |
+| `--volume NAME=PATH` | A volume recreated empty every attempt. |
+| `--state-probe NAME=COMMAND` | Run before every model step; its exit status and output hash must replay (see below). |
+| `--ready COMMAND` | Holds the harness until the image's own services are up, in every attempt. |
+| `--settle-timeout S` | How long a replayed reply waits for background jobs (default 30, 0 to turn off). |
+| `--idle COMMAND` | Succeeds when no queued background work is pending (the example checks a Celery queue in Redis); a rebuild waits for it wherever the original run was idle. |
+| `--timeout S` | The episode's live working time, across attempts. Replay isn't charged, a resumed attempt carries on from the time already used, and running out ends the episode as `timed_out`. |
+| `--attempt-timeout S` | Wall-clock limit per attempt, for hangs; retried. |
+| `--fault-after-steps N --fault environment` | Kills the first attempt's container after N model steps, to try resume on demand. |
+
+`resumable-evals --help` lists the rest.
 
 ## Status
 
-Rollout steps 1–3 (prototype, determinism controls, orchestrator) work with Docker environments. There are 71 tests; 12 of them run in Docker:
+Steps 1–3 of the [rollout plan](docs/DESIGN.md#rollout-plan) (prototype, determinism controls, orchestrator) work with Docker environments. There are 71 tests; 12 of them run in Docker:
 
 - A container killed mid-episode is rebuilt from its image, and the episode finishes with nothing done twice. `date` inside the container read the pinned step time in both runs.
 - A container running Postgres is killed mid-episode. On the fresh database, the re-executed inserts return the same ids and `created_at`, each exactly its step's pinned time. With the randomness shim, `gen_random_uuid()` replays too. Without the shim, the rebuild diverges on it.
@@ -54,7 +98,7 @@ Rollout steps 1–3 (prototype, determinism controls, orchestrator) work with Do
 - An order queued for a background worker ships while the model thinks in the original run. Without `--idle` the replay cancels it first and diverges; with it the replay waits and matches.
 - An agent searching the whole container for recordings, an earlier attempt's archive included, finds nothing, and the container has no bind mounts.
 - Four 0.4 s steps against a 1.4 s limit: an uninterrupted run times out, and so does one that crashed and resumed.
-- Real Claude Code in a container, live: the OAuth token is in Infisical and added by the proxy, so the container only has a placeholder.
+- Real Claude Code in a container, live (run by hand, not in CI, since it needs a credential): the OAuth token stays on the host and is added by the proxy, so the container only has a placeholder.
   - The task called the MCP tool and ran Bash commands printing two `uuid4()`s, a `tempfile` name and `/dev/urandom` bytes.
   - The container was killed after model step 4. A fresh one replayed and checked steps 0–3, went live, and finished the task.
   - A full replay of all 8 steps in another fresh container, with no credential at all, matched every step. The four random outputs were byte-identical to the original run's.
@@ -104,11 +148,27 @@ Not covered yet: databases or MCP servers in other containers (sidecars, compose
   The two Redis checks count only jobs still queued. A job a worker has already picked up is not in the list, so also check that none is running (for Celery, `celery -A app inspect active`).
 - **Time limit:** each recorded model reply carries the episode's live working time so far, fsynced with it. A resumed attempt starts counting once its replay is used up, so replay and the step lost in the failure aren't charged. A model call already in flight when the limit passes still completes.
 - **Divergence** is reported in `<recording>.diverged.json` and in `episode.json`. By default the episode is then rerun from scratch (`reran_after_divergence: true`), with the diverged recordings kept in `diverged-<attempt>/`.
-- **Linux hosts:** set `--proxy-bind` to the bridge gateway (e.g. 172.17.0.1), not 0.0.0.0, which would expose the proxy and its credential to the network.
+- **Linux hosts:** see [Security](#security).
+
+## Security
+
+The model proxy holds the credential and forwards model calls to the provider, so treat its address as sensitive:
+
+- **Linux hosts:** set `--proxy-bind` to the Docker bridge gateway (`docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'`, often 172.17.0.1). Never 0.0.0.0, which would expose the proxy and its credential to the network. On macOS the default 127.0.0.1 works.
+- Recordings hold full model transcripts and tool results. Keep episode directories private if your tasks are.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Development
 
 ```sh
 uv sync
-uv run pytest
+uv run pytest          # 71 tests; the 12 Docker tests skip without Docker
+uv run ruff check .
 ```
+
+On a Linux host, the Docker tests need `RESUMABLE_EVALS_TEST_PROXY_BIND` set to the bridge gateway, as in CI. See [CONTRIBUTING.md](CONTRIBUTING.md) before changing record or rebuild behaviour.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

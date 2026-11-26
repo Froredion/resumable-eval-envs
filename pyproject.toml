@@ -1,20 +1,49 @@
 [project]
 name = "resumable-evals"
-version = "0.0.1"
+version = "0.1.0"
 description = "Record and rebuild: resume eval episodes that fail mid-run without changing harnesses or agents."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Erickson Talaue" }]
 requires-python = ">=3.12"
 dependencies = []
+keywords = ["evals", "llm", "agents", "mcp", "docker", "reproducibility", "record-replay"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.scripts]
+resumable-evals = "resumable_evals.orchestrator:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.8"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/resumable_evals"]
 
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "examples", "docs", "LICENSE", "NOTICE", "README.md", "CONTRIBUTING.md", "SECURITY.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

@@ -4,3 +4,10 @@ __pycache__/
 .pytest_cache/
 recordings/
 .env
+dist/
+build/
+*.egg-info/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
