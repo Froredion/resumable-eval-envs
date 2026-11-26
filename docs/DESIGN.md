@@ -126,16 +126,19 @@ Rollout steps 1–3 are built (status and usage in the README). Building them re
 
 - **The harness's own tools are checked in the next model request.** Claude Code runs Bash, Write and Edit itself, so they never pass through the MCP proxy. Their results reach the model in the next request, and the model proxy compares every tool result after the model's last turn with the recording. No shell wrapper or exec hook is needed to check them.
 - **Replies are matched by order and checked by content.** A replayed request must have the recorded shape (model, stream flag, message count). Its assistant turns must also match exactly: they are the harness's rendering of recorded replies, so a request answered from the wrong recorded event diverges. Some requests arrive while another is still in flight (parallel subagents). These are recorded as overlapping, and on rebuild each is answered from the event it matches, in whatever order they arrive.
-- **Clock:** libfaketime, frozen at each step's pinned time by default. Wall-clock time reads exactly the step's time, and monotonic clocks are untouched, so sleeps and timeouts still work. The container boots with the clock already pinned, so its own services (Postgres) run on it. The clock file lives inside the container and is written with `docker exec`: through Docker Desktop's bind mounts, an updated file reads as missing or stale. Claude Code needs libfaketime 0.9.11 or later.
+- **Clock:** libfaketime, frozen at each step's pinned time by default. Wall-clock time reads exactly the step's time, and monotonic clocks are untouched, so sleeps and timeouts still work. The container boots with the clock already pinned, so its own services (Postgres) run on it. The clock file lives inside the container and is written with `docker exec`: through bind mounts from a macOS host (Docker runs in a Linux VM there), an updated file reads as missing or stale. Claude Code needs libfaketime 0.9.11 or later.
 - **Randomness:** a preload shim (`librandpin.so`) replaces libc's random sources and shared OpenSSL's `RAND_bytes` with a stream per process. The stream is keyed by the seed, the step's pinned time and a per-step counter.
   - **Pinned:** Python (`uuid4`, `random`, `tempfile`), `/dev/urandom` readers, glibc's `arc4random`, and Postgres `gen_random_uuid()` and `random()`.
   - **Not pinned:**
-    - A statically linked OpenSSL. Node's `crypto` mixes the pid, thread id and time into its nonce.
-    - Tools that derive names from the monotonic clock, such as Debian bookworm's `mktemp`.
+    - Node's `crypto` and `Math.random`: same seed, different values, even though `node` draws from the shim. The cause is not established.
+    - Debian bookworm's `mktemp`, which binds no random source, only `clock_gettime`.
 
     These show up as divergences.
   - **Boot is kept apart.** Draws made while the environment boots are counted separately from the harness's. `--ready` holds the harness until the environment's services are up. Together these stop a boot of varying length from shifting the harness's random values.
 - **Background jobs:** the container's processes are recorded as each model reply comes back. On rebuild, the reply is held until every job that had exited by that point in the original run has exited again. This means the agent reads a job's output at the same stage in both runs.
+- **Queued work:** a queue worker never exits, so waiting for processes doesn't cover it. Without a wait, a fast replay's next call can overtake a job that finished during the model's thinking time in the original run (an order cancelled before the worker shipped it). The environment can supply an idle check, a command that succeeds when nothing is pending. Its result is recorded with each reply, and a rebuild waits for it wherever the original run was idle.
+- **Recordings stay outside the environment.** The first build mounted the episode directory into the container, so an agent could read its own transcript, or an earlier attempt's after a divergence, and change what a rebuild is checked against. Both proxies now run on the host. The harness reaches each MCP proxy through a small relay copied into the container, and the proxy starts the real server there with `docker exec`.
+- **The time limit belongs to the episode.** Each recorded model reply carries the live working time so far. A resumed attempt carries on from it, and isn't charged for replay or for the step lost in the failure. Using up the limit ends the episode, as it would an uninterrupted one. A separate per-attempt limit catches hangs and triggers a rebuild.
 - **State probes** cover side effects no tool result shows, such as a database row written with a different value. A probe is a command run every step whose output hash must replay.
 - **The proxy adds the credential**, so it never enters the container. Auth failures (401, 403) and transient ones (408, 429, 5xx) are not recorded.
 - **Nothing carries state between attempts:**
@@ -149,7 +152,7 @@ Rollout steps 1–3 are built (status and usage in the README). Building them re
 - [ ] Which harnesses and model providers need support first?
 - [x] Which tools or MCP servers read the clock or generate random values that need pinning? *Partly answered:*
   - Anything that reads the clock, `getrandom`, `/dev/urandom` or a shared OpenSSL is now pinned.
-  - Node's `crypto` and monotonic-clock temp names are not.
+  - Node's `crypto` and bookworm's `mktemp` are not (causes not established).
   - Per-environment divergence rates will show what else matters.
 - [x] Do harnesses run commands directly in containers, or only through MCP? *Yes:* Claude Code runs Bash, Write and Edit itself. Their results are checked in the next model request.
 - [ ] Typical episode length and step count, to set checkpoint frequency?

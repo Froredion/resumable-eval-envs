@@ -20,9 +20,13 @@
  * Covered: getrandom(), getentropy(), arc4random*(), syscall(SYS_getrandom),
  * reads of /dev/urandom and /dev/random opened through libc, and OpenSSL's
  * RAND_*bytes() when libcrypto is a shared library (Postgres
- * gen_random_uuid() and the seed of random()). OpenSSL's own generator
- * cannot be pinned from its seed alone: it mixes the pid, thread id and
- * time into its nonce.
+ * gen_random_uuid() and the seed of random(); both replay with it).
+ *
+ * Not pinned, as observed with libfaketime and this shim both loaded:
+ * Node's crypto and Math.random (node binds getrandom and getentropy to
+ * this shim and draws from it once per process, yet its output still
+ * varies; why is not established), and Debian bookworm's mktemp(1), which
+ * binds no random source at all, only clock_gettime.
  *
  * If the counter cannot be taken, the process falls back to real
  * randomness and a line is appended to RESUMABLE_EVALS_RANDOM_DIR/errors
@@ -349,8 +353,9 @@ FILE *fopen64(const char *path, const char *mode) {
     return real_fopen64(path, mode);
 }
 
-/* OpenSSL (shared libcrypto): its generator mixes pid, thread id and time
- * into the seed, so pinning the kernel source is not enough. */
+/* OpenSSL (shared libcrypto): RAND_bytes answered from the pinned stream
+ * directly, rather than relying on OpenSSL's generator, whose output from a
+ * pinned seed was not tested. */
 
 typedef int (*rand_fn)(unsigned char *, int);
 typedef int (*rand_ex_fn)(void *, unsigned char *, size_t, unsigned int);

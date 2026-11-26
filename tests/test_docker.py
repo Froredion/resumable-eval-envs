@@ -37,7 +37,7 @@ def image():
 
 @pytest.fixture
 def shared_dir():
-    # Docker Desktop for macOS only shares some host paths; pytest's tmp_path (/var/folders) is not one of them.
+    # Episode directories are no longer mounted into containers; this one is kept under $HOME regardless.
     d = Path.home() / ".cache" / "resumable-evals-tests" / uuid.uuid4().hex[:8]
     d.mkdir(parents=True)
     yield d

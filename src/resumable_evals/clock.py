@@ -26,8 +26,8 @@ which Claude Code needs; see examples/claude-code/Dockerfile).
 
 The file must live where the environment's processes read it reliably. In a
 container that means the container's own filesystem, written with
-``docker exec`` (see ``environments``): through Docker Desktop's bind mounts
-a file updated on the host reads as missing for a while after a rename (and
+``docker exec`` (see ``environments``): through a macOS host's bind mounts
+(Docker runs in a Linux VM there) a file updated on the host reads as missing for a while after a rename (and
 libfaketime silently falls back to the real clock), or keeps its old
 content after an in-place write.
 
