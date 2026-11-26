@@ -72,8 +72,8 @@ while True:
         if block["type"] != "tool_use":
             continue
         error = False
-        if block["name"] == "incr":
-            text, error = mcp.call("incr")
+        if block["name"] in ("incr", "order", "cancel"):  # the MCP server's tools
+            text, error = mcp.call(block["name"])
         elif block["name"] == "clock":
             if "LD_PRELOAD" in os.environ:
                 text = subprocess.run(["date", "-u", "+%s"], capture_output=True, text=True).stdout

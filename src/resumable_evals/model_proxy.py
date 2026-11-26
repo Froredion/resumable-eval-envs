@@ -57,6 +57,14 @@ done, as they did in the original run, however much faster the replay
 is. A timeout is noted in ``settle_timeouts`` and the replay carries on;
 the result checks still decide.
 
+Background work that is not a process exiting (a queue worker that keeps
+running, Celery, Sidekiq, a database job table) is covered by an ``idle``
+check supplied with the environment: True when nothing is pending. It is
+recorded with each reply as it comes back; on rebuild, a reply recorded
+idle is held until the check passes again, within the same
+``settle_timeout``. A reply recorded busy is not held: partial progress
+cannot be reproduced, and the result checks decide.
+
 Live time: each recorded reply carries ``live``, the episode's working
 time so far in seconds (fsynced with it, so it survives any crash). A
 proxy on a recording starts from the last recorded value and counts only
@@ -206,6 +214,7 @@ class ModelProxy:
         self.upstream_headers = upstream_headers or {}
         self.state_probe: Callable[[], dict[str, Any]] | None = None  # see the module docstring
         self.processes: Callable[[], list[str]] | None = None  # see the module docstring
+        self.idle: Callable[[], bool] | None = None  # see the module docstring
         self.settle_timeout = 30.0
         self.settle_timeouts: list[dict[str, Any]] = []
         self.on_record: Callable[[int], None] | None = None  # called with the step count after each live reply is recorded
@@ -326,7 +335,7 @@ class ModelProxy:
                 if differing:
                     return self._diverge(event, f"environment state differs: {', '.join(differing)}",
                                          {"recorded_state": event.meta["state"], "state": state})
-            if self.processes and "processes" in event.meta:
+            if (self.processes and "processes" in event.meta) or (self.idle and event.meta.get("idle")):
                 self._settle(event)
             reply = self.cursor.take_model(event)
             if self.clock and "t" in event.meta:
@@ -339,6 +348,7 @@ class ModelProxy:
         self.auth_failed = status if status in (401, 403) else None
         if not unrecorded(status):
             processes = self.processes() if self.processes and not overlaps else None
+            idle = self.idle() if self.idle and not overlaps else None
             t = time.time()
             live = self.live_time()
             content_type = next((v for k, v in out if k.lower() == "content-type"), "application/json")
@@ -351,6 +361,7 @@ class ModelProxy:
                 live=live,
                 **({"state": state} if state is not None else {}),
                 **({"processes": processes} if processes is not None else {}),
+                **({"idle": idle} if idle is not None else {}),
                 **({"overlaps_previous": True} if overlaps else {}),
             )
             self._steps += 1
@@ -361,14 +372,22 @@ class ModelProxy:
         return status, out, data
 
     def _settle(self, event: Any) -> None:
-        """Hold the reply until no process runs that had exited by this point in the original run."""
-        recorded = Counter(event.meta["processes"])
+        """Hold the reply until the environment is as settled as it was at this point in the
+        original run: no process running that had exited, and idle if it was idle."""
         deadline = time.monotonic() + self.settle_timeout
-        while extra := Counter(self.processes()) - recorded:
-            if time.monotonic() > deadline:
-                self.settle_timeouts.append({"step": event.step, "still_running": sorted(extra.elements())})
-                return
-            time.sleep(0.2)
+        if self.processes and "processes" in event.meta:
+            recorded = Counter(event.meta["processes"])
+            while extra := Counter(self.processes()) - recorded:
+                if time.monotonic() > deadline:
+                    self.settle_timeouts.append({"step": event.step, "still_running": sorted(extra.elements())})
+                    return
+                time.sleep(0.2)
+        if self.idle and event.meta.get("idle"):
+            while not self.idle():
+                if time.monotonic() > deadline:
+                    self.settle_timeouts.append({"step": event.step, "not_idle": True})
+                    return
+                time.sleep(0.2)
 
     def _diverge(self, event: Any, detail: str, extra: dict[str, Any] | None = None) -> Response:
         d = Diverged(event, detail)

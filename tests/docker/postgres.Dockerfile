@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python-is-pytho
  && rm -rf /var/lib/apt/lists/*
 COPY --from=libfaketime /src/src/libfaketime.so.1 /usr/local/lib/libfaketime.so.1
 COPY --from=libfaketime /randpin/librandpin.so /usr/local/lib/librandpin.so
-COPY fake_harness.py pg_mcp_server.py /opt/eval/
+COPY fake_harness.py pg_mcp_server.py pg_jobs_mcp_server.py /opt/eval/
 ENV POSTGRES_HOST_AUTH_METHOD=trust
 RUN mkdir -p /work && chmod 777 /work
 WORKDIR /work

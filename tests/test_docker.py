@@ -361,3 +361,59 @@ def test_recordings_never_enter_the_environment(image, shared_dir):
                for r in m["content"] if r["tool_use_id"].endswith("_1")]
     assert snooped == ["nothing", "nothing"]  # step 0 in the original run, step 1 after the rebuild
     assert len(Recording(shared_dir / "episode" / "mcp-fake.jsonl").events) == 2  # recorded on the host, through the relay
+
+
+# -- queued background work -------------------------------------------------------
+
+def queue_episode(pg_image, shared_dir, idle):
+    """Step 0 places an order; a worker ships it a second later; the model takes two; step 1 cancels.
+
+    In the original run the order has shipped, so the cancel is refused. A replay
+    is fast enough to cancel it first, unless it waits for the queue to drain.
+    """
+    up = Upstream(script=[["order"], ["cancel"]], delay=2)
+    env = DockerEnvironment(pg_image, f"resumable-test-q-{shared_dir.name}")
+    ep = Episode(
+        dir=shared_dir / "episode",
+        harness=["python", "/opt/eval/fake_harness.py", "{mcp_config}"],
+        environment=env,
+        mcp_servers={"fake": ["python", "/opt/eval/pg_jobs_mcp_server.py"]},
+        upstream=up.url,
+        faketime_lib=FAKETIME,
+        ready=["pg_isready", "-h", "127.0.0.1", "-q"],
+        idle=idle,
+        timeout=120,
+        fault_after_steps=3,  # after the last step: everything replays
+        fault="environment",
+        rerun_on_divergence=False,
+    )
+    return env, ep, up
+
+
+NO_PENDING = ["sh", "-c", """test "$(psql -h 127.0.0.1 -U postgres -qAt -c "SELECT count(*) FROM orders WHERE status = 'pending'")" = 0"""]
+
+
+def test_without_an_idle_check_a_queued_job_is_overtaken(pg_image, shared_dir):
+    env, ep, up = queue_episode(pg_image, shared_dir, idle=None)
+    try:
+        meta = ep.run()
+    finally:
+        env.stop()
+        up.httpd.shutdown()
+    assert meta["status"] == "diverged"
+    assert "cancelled" in meta["attempts"][1]["divergence"][0]["detail"]
+
+
+def test_an_idle_check_waits_for_queued_jobs_as_the_original_run_did(pg_image, shared_dir):
+    env, ep, up = queue_episode(pg_image, shared_dir, idle=NO_PENDING)
+    try:
+        meta = ep.run()
+    finally:
+        env.stop()
+        up.httpd.shutdown()
+    assert [a["outcome"] for a in meta["attempts"]] == ["failed", "completed"], meta
+    assert not any("settle_timeouts" in a for a in meta["attempts"])
+    events = Recording(shared_dir / "episode" / "model.jsonl").events
+    assert events[1].meta["idle"] is True  # shipped while the model thought
+    cancel = [r["content"] for r in events[2].request["body"]["messages"][-1]["content"]]
+    assert cancel == ["order 1 already shipped"]

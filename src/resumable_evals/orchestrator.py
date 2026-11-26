@@ -101,6 +101,9 @@ class Episode:
     # Docker only: hold each replayed reply until background jobs that had finished by then in the
     # original run have finished again, waiting at most this long (see model_proxy.py); None: off
     settle_timeout: float | None = None
+    # argv inside; exits 0 when no background work (queued jobs) is pending: recorded with each
+    # reply, and a rebuild waits for it where the original run was idle (see model_proxy.py)
+    idle: list[str] | None = None
     clock_mode: str = "frozen"  # or "advancing"; see clock.py
     seed: int = 0
     max_attempts: int = 4
@@ -180,6 +183,8 @@ class Episode:
         if self.settle_timeout is not None:
             proxy.processes = lambda: self._processes(rt)
             proxy.settle_timeout = self.settle_timeout
+        if self.idle:
+            proxy.idle = lambda: self._idle(rt, boot_env)
         httpd = proxy.serve(self.environment.proxy_bind)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
@@ -281,6 +286,14 @@ class Episode:
                 return True
             time.sleep(0.2)
         return False
+
+    def _idle(self, rt: Runtime, env: dict[str, str]) -> bool:
+        cmd, host_env, cwd = rt.command(self.idle or [], env)
+        try:
+            return subprocess.run(cmd, env=host_env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True,
+                                  timeout=60).returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
 
     def _processes(self, rt: Runtime) -> list[str]:
         """Command lines of the processes running in the environment, sorted."""
@@ -406,6 +419,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--settle-timeout", type=float, default=30,
                         help="with --image: seconds a replayed reply waits for background jobs to finish as they had "
                              "in the original run (0: don't wait)")
+    parser.add_argument("--idle", metavar="COMMAND",
+                        help="command run inside the environment that succeeds when no background work is pending; "
+                             "a rebuild waits for it wherever the original run was idle")
     parser.add_argument("--random-lib", help="randomness shim (librandpin.so) to preload into everything in the environment")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="environment variable for the harness (repeat)")
     parser.add_argument("--clock", choices=["frozen", "advancing"], default="frozen", help="pinned clock mode (see clock.py)")
@@ -454,7 +470,8 @@ def main(argv: list[str] | None = None) -> int:
         env=dict(kv.partition("=")[::2] for kv in args.env),
         upstream_headers=headers, faketime_lib=args.faketime_lib, random_lib=args.random_lib,
         ready=["sh", "-c", args.ready] if args.ready else None, ready_timeout=args.ready_timeout,
-        settle_timeout=args.settle_timeout if args.image and args.settle_timeout > 0 else None, clock_mode=args.clock, seed=args.seed, max_attempts=args.max_attempts,
+        settle_timeout=args.settle_timeout if args.image and args.settle_timeout > 0 else None,
+        idle=["sh", "-c", args.idle] if args.idle else None, clock_mode=args.clock, seed=args.seed, max_attempts=args.max_attempts,
         timeout=args.timeout, attempt_timeout=args.attempt_timeout, rerun_on_divergence=not args.no_rerun_on_divergence,
         fault_after_steps=args.fault_after_steps, fault=args.fault,
     )
